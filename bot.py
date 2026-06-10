@@ -40,7 +40,7 @@ MAX_POSITIONS  = 3
 # TP dikembalikan ke 0.7% → R:R lebih sehat ~2:1 setelah fee
 # Net TP after fee  : ~+0.60%
 # Net SL after fee  : ~-0.30%
-EXTREME_PROFIT_PCT = 0.0070  # +0.7% Take Profit  ← dikembalikan dari 0.0030
+EXTREME_PROFIT_PCT = 0.0030  # +0.7% Take Profit  ← dikembalikan dari 0.0030
 HARD_SL_PCT        = 0.0020  # -0.2% Hard Stop Loss
 FUTURES_FEE_PCT    = 0.0005  # Fee Taker Binance 0.05%
 
