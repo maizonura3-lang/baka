@@ -1,10 +1,17 @@
 """
-Bot Scalping v18.3 — INVERSE EXTREME PROFIT MODE (LIVE REAL TRADE)
+Bot Scalping v18.4.0 — DRY RUN LOG MODE (PAPER TRADING)
 ====================================================
-- INVERSE MODE: Sinyal LONG dieksekusi SHORT, sinyal SHORT dieksekusi LONG.
-- EXTREME PROFIT: Profit +0.05% langsung bungkus (mengubah ExtremeCut jadi Profit).
-- IMPATIENT EXIT: Hold 5 detik, jika profit dikit bungkus, jika loss langsung cut.
-- HARD SL: Diperlebar jadi 0.2% agar tidak kena noise sebelum koreksi mikro terjadi.
+- MODE NORMAL: Sinyal LONG dieksekusi LONG, sinyal SHORT dieksekusi SHORT.
+- EXECUTION: LOG ONLY (Tidak melakukan order ke Binance Testnet).
+- FEE CALCULATION: PnL yang ditampilkan tetap dipotong fee Taker Binance (0.05% per transaksi).
+- v18.4.0 CHANGES:
+    * INVERSE_MODE dihapus sepenuhnya
+    * Sinyal LONG  → eksekusi LONG  (normal)
+    * Sinyal SHORT → eksekusi SHORT (normal)
+    * EXTREME_PROFIT_PCT dikembalikan ke 0.7%
+    * HARD_SL_PCT tetap 0.2%
+    * Semua label & log mencerminkan arah sinyal asli
+    * R:R setelah fee: Net TP ~+0.60% | Net SL ~-0.30%
 """
 
 import os, time, math, threading, queue
@@ -19,24 +26,26 @@ import numpy as np
 
 load_dotenv()
 client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
-# MATIKAN TESTNET AGAR ENTRY KE BINANCE ASLI
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
 # ═══════════════════════════════════════════════════════
-#  CONFIG v18.3 - INVERSE EXTREME PROFIT
+#  CONFIG v18.4.0 — NORMAL MODE (NO INVERSE)
 # ═══════════════════════════════════════════════════════
-INVERSE_MODE   = True   # ⬅️ MASTER SWITCH UNTUK STRATEGI KEBALIKAN
 
 LEVERAGE       = 20
-ORDER_USDT     = 2.0    # ⚠️ PERHATIAN: Binance mewajibkan min order $5 USDT. Ubah ini jika error MIN_NOTIONAL.
+ORDER_USDT     = 2.0
 MAX_POSITIONS  = 3
 
-# ── TARGET SUPER KETAT (EXTREME PROFIT) ────────────
-EXTREME_PROFIT_PCT = 0.0005  # +0.05% langsung Take Profit!
-HARD_SL_PCT        = 0.0020  # -0.20% Hard Cut Loss (agar tak terseret tren)
+# ── TARGET v18.4.0 ──────────────────────────────────────
+# TP dikembalikan ke 0.7% → R:R lebih sehat ~2:1 setelah fee
+# Net TP after fee  : ~+0.60%
+# Net SL after fee  : ~-0.30%
+EXTREME_PROFIT_PCT = 0.0070  # +0.7% Take Profit  ← dikembalikan dari 0.0030
+HARD_SL_PCT        = 0.0020  # -0.2% Hard Stop Loss
+FUTURES_FEE_PCT    = 0.0005  # Fee Taker Binance 0.05%
 
 MIN_BASE_VOL   = 25_000_000
-MIN_VR         = 1.1    
+MIN_VR         = 1.1
 BR_LONG_MIN    = 0.48
 BR_SHORT_MAX   = 0.52
 
@@ -45,9 +54,8 @@ MONITOR_INT    = 0.25
 SCAN_DELAY     = 0.015
 BATCH_SIZE     = 15
 MAX_WORKERS    = 8
-MAX_HOLD_SEC   = 60      # Lebih cepat dari 180s, karena ini scalping ekstrim
 
-MIN_SCORE      = 40
+MIN_SCORE      = 52
 MIN_GAP        = 10
 COOLDOWN_SEC   = 3
 
@@ -70,13 +78,12 @@ SYMBOLS = [
 ]
 SYMBOLS = list(dict.fromkeys(SYMBOLS))
 
-paper_positions = {}
+live_positions  = {}
 trade_log       = []
 _ohlcv_cache    = {}
 _sym_cooldown   = {}
 _ticker_cache   = {}
 _ticker_ts      = 0
-_precisions     = {} # Cache untuk desimal LOT_SIZE order Binance
 _lock           = threading.Lock()
 _executor       = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 _rescan_q       = queue.Queue()
@@ -86,11 +93,32 @@ _macro = {"fng": 50, "btc": "UNKNOWN", "last_fng": 0, "last_btc": 0}
 _ks    = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
 _stats = {
     "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0,
-    "extreme_tp": 0, "hard_sl": 0, "impatient_cut": 0, "force": 0, 
+    "extreme_tp": 0, "hard_sl": 0, "force": 0,
     "hist": deque(maxlen=200), "start": time.time(),
 }
 
-def qty(price): return (ORDER_USDT * LEVERAGE) / price
+# ═══════════════════════════════════════════════════════
+#  BINANCE UTILS
+# ═══════════════════════════════════════════════════════
+_precision_cache = {}
+def get_precision(symbol):
+    global _precision_cache
+    if symbol in _precision_cache: return _precision_cache[symbol]
+    try:
+        info = client.futures_exchange_info()
+        for s in info['symbols']:
+            if s['symbol'] == symbol:
+                prec = int(s['quantityPrecision'])
+                _precision_cache[symbol] = prec
+                return prec
+    except: pass
+    return 2
+
+def qty(symbol, price):
+    raw_qty = (ORDER_USDT * LEVERAGE) / price
+    prec = get_precision(symbol)
+    return round(raw_qty, prec)
+
 def price_live(symbol):
     try: return float(client.futures_symbol_ticker(symbol=symbol)["price"])
     except: return 0.0
@@ -171,31 +199,30 @@ def ks_upd(pnl):
     _ks["consec"] = 0 if pnl >= 0 else _ks["consec"] + 1
 
 # ═══════════════════════════════════════════════════════
-#  SIGNAL ENGINE DENGAN INVERSE LOGIC
+#  SIGNAL — MODE NORMAL (TIDAK ADA INVERSE)
+#  Sinyal LONG  → eksekusi LONG
+#  Sinyal SHORT → eksekusi SHORT
 # ═══════════════════════════════════════════════════════
 def signal(df):
+    """Menghasilkan sinyal berdasarkan TA. Mode normal tanpa inverse."""
     if df is None or len(df) < 55: return None, 0, [], 0.0
-
     row, prev, prev2 = df.iloc[-2], df.iloc[-3], df.iloc[-4]
     p, e5, e9, e21, e50 = row["close"], row["e5"], row["e9"], row["e21"], row["e50"]
     rsi, mh, mh_p, mh_p2 = row["rsi"], row["mh"], prev["mh"], prev2["mh"]
     vr, br, m5, body, atr, adx = row["vr"], row["br"], row["m5"], row["br2"], row["atr"], row["adx"]
-    btc = _macro["btc"]
 
     if vr < MIN_VR: return None, 0, [], atr
-
     lp = sp = 0
     sl, ss = [], []
 
     if p > e5 > e9 > e21 > e50:   lp += 30; sl.append("EMA_stack↑")
     elif p > e5 > e9 > e21:       lp += 22; sl.append("EMA↑↑")
-
     if p < e5 < e9 < e21 < e50:   sp += 30; ss.append("EMA_stack↓")
     elif p < e5 < e9 < e21:       sp += 22; ss.append("EMA↓↓")
 
-    if m5 > 0.005:  lp += 25; sl.append(f"Mom+{m5*100:.1f}%")
+    if m5 > 0.005:   lp += 25; sl.append(f"Mom+{m5*100:.1f}%")
     elif m5 > 0.003: lp += 18; sl.append(f"Mom+{m5*100:.1f}%")
-    if m5 < -0.005: sp += 25; ss.append(f"Mom{m5*100:.1f}%")
+    if m5 < -0.005:  sp += 25; ss.append(f"Mom{m5*100:.1f}%")
     elif m5 < -0.003: sp += 18; ss.append(f"Mom{m5*100:.1f}%")
 
     if mh_p <= 0 and mh > 0:           lp += 22; sl.append("MACD_X↑")
@@ -214,110 +241,67 @@ def signal(df):
 
     if adx > 35: lp += 8; sp += 8; sl.append(f"ADX{adx:.0f}"); ss.append(f"ADX{adx:.0f}")
 
+    btc = _macro["btc"]
     btc_sw = btc in ("SIDEWAYS", "UNKNOWN")
     thresh = 40 if btc_sw else MIN_SCORE
     gap    = abs(lp - sp)
 
     if lp <= sp or lp < thresh or gap < MIN_GAP:
-        if sp <= lp or sp < thresh or gap < MIN_GAP:
-            return None, max(lp, sp), [], atr
-        if br >= BR_SHORT_MAX: return None, sp, [], atr  
-        
-        if INVERSE_MODE: return "LONG", sp, ss[:3] + ["(INV)"], atr
+        if sp <= lp or sp < thresh or gap < MIN_GAP: return None, max(lp, sp), [], atr
+        if br >= BR_SHORT_MAX: return None, sp, [], atr
         return "SHORT", sp, ss[:3], atr
 
-    if br <= BR_LONG_MIN: return None, lp, [], atr  
-    
-    if INVERSE_MODE: return "SHORT", lp, sl[:3] + ["(INV)"], atr
+    if br <= BR_LONG_MIN: return None, lp, [], atr
     return "LONG", lp, sl[:3], atr
 
+
 # ═══════════════════════════════════════════════════════
-#  REAL OPEN / CLOSE (MODIFIKASI LIVE TRADING)
+#  DRY RUN OPEN / CLOSE
 # ═══════════════════════════════════════════════════════
-def paper_open(sym, direction, score, sigs, price, atr):
+def live_open(sym, direction, score, sigs, price, atr):
     with _lock:
-        if sym in paper_positions or len(paper_positions) >= MAX_POSITIONS: return
-        paper_positions[sym] = {"_r": True}
+        if sym in live_positions or len(live_positions) >= MAX_POSITIONS: return
+        live_positions[sym] = {"_r": True}
 
-    # --- REAL BINANCE API EXECUTION ---
     try:
-        # 1. Pastikan Leverage Sesuai
-        client.futures_change_leverage(symbol=sym, leverage=LEVERAGE)
-        
-        # 2. Ambil LOT_SIZE precision (desimal koin) agar tidak error saat order
-        if sym not in _precisions:
-            info = client.futures_exchange_info()
-            for item in info['symbols']:
-                if item['symbol'] == sym:
-                    _precisions[sym] = item['quantityPrecision']
-                    break
-                    
-        prec = _precisions.get(sym, 3)
-        q = round(qty(price), prec)
-
-        # 3. Lempar Market Order Asli
-        side_str = "BUY" if direction == "LONG" else "SELL"
-        order = client.futures_create_order(
-            symbol=sym,
-            side=side_str,
-            type="MARKET",
-            quantity=q
-        )
-        
-        # Ambil harga masuk aslinya dari Binance
-        exec_price = float(order.get('avgPrice', price))
-        if exec_price == 0: exec_price = price
-        
+        q_val = qty(sym, price)
+        entry_price = price
     except Exception as e:
-        print(f"❌ GAGAL ENTRY REAL {sym}: {e}")
-        with _lock: paper_positions.pop(sym, None)
+        print(f" ❌ Gagal Open {sym}: {e}")
+        with _lock: live_positions.pop(sym, None)
         return
-    # ----------------------------------
 
     pos = {
-        "side": direction, "entry": exec_price, "qty": q,
+        "side": direction, "entry": entry_price, "qty": q_val,
         "open_time": time.time(), "score": score, "sigs": sigs, "atr": atr,
     }
-    with _lock: paper_positions[sym] = pos
+    with _lock: live_positions[sym] = pos
 
     d = "🟢" if direction == "LONG" else "🔴"
-    print(f"\n  {d} [REAL ENTRY] {sym} {direction} @{exec_price:.6g} (Qty: {q})")
-    print(f"     Target ExtremeProfit: ±{EXTREME_PROFIT_PCT*100}% | Hard SL: ±{HARD_SL_PCT*100}%")
-    print(f"     Score:{score} | BTC:{_macro['btc']} | Sigs:{' | '.join(sigs)}")
+    print(f"\n  {d} [DRY RUN LOG] {sym} {direction} @{entry_price:.6g}")
+    print(f"      Target Profit: +{EXTREME_PROFIT_PCT*100:.1f}% | Hard SL: -{HARD_SL_PCT*100:.1f}%")
     _stats["trades"] += 1
 
-def paper_close(sym, reason, price=None):
+def live_close(sym, reason, price=None):
     with _lock:
-        pos = paper_positions.pop(sym, None)
+        pos = live_positions.pop(sym, None)
     if pos is None or pos.get("_r"): return
 
     if price is None: price = price_live(sym)
-    side, entry, q = pos["side"], pos["entry"], pos["qty"]
+    side, entry, q_val = pos["side"], pos["entry"], pos["qty"]
 
-    # --- REAL BINANCE API EXECUTION ---
-    try:
-        side_str = "SELL" if side == "LONG" else "BUY"
-        order = client.futures_create_order(
-            symbol=sym,
-            side=side_str,
-            type="MARKET",
-            quantity=q
-        )
-        
-        exec_price = float(order.get('avgPrice', price))
-        if exec_price != 0: price = exec_price
-    except Exception as e:
-        print(f"❌ GAGAL CLOSE REAL {sym}: {e}")
-        # Log tetap lanjut perhitungan stat untuk menghindari nyangkut & error spam
-    # ----------------------------------
+    gross_pnl = (price - entry) * q_val if side == "LONG" else (entry - price) * q_val
+    open_fee  = (entry * q_val) * FUTURES_FEE_PCT
+    close_fee = (price * q_val) * FUTURES_FEE_PCT
+    total_fee = open_fee + close_fee
+    pnl = gross_pnl - total_fee
 
-    pnl = (price - entry) * q if side == "LONG" else (entry - price) * q
     pct = (price - entry) / entry * 100 if side == "LONG" else (entry - price) / entry * 100
     hold = time.time() - pos["open_time"]
     e = "🟢" if pnl >= 0 else "🔴"
 
-    print(f"  {e} [REAL CLOSE] {sym} {side} CLOSE — {reason}")
-    print(f"     {entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL:{pnl:+.5f}U")
+    print(f"  {e} [DRY RUN LOG] {sym} {side} CLOSE — {reason}")
+    print(f"     {entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL Bersih:{pnl:+.5f}U (Fee:{total_fee:.5f}U)")
 
     _stats["pnl"] += pnl
     _stats["hist"].append(pnl)
@@ -332,8 +316,6 @@ def paper_close(sym, reason, price=None):
 
     if "ExtremeProfit" in reason: _stats["extreme_tp"] += 1
     elif "HardSL" in reason: _stats["hard_sl"] += 1
-    elif "Impatient" in reason: _stats["impatient_cut"] += 1
-    elif "Force" in reason: _stats["force"] += 1
 
     trade_log.append({
         "sym": sym, "side": side, "entry": round(entry, 7), "exit": round(price, 7),
@@ -343,11 +325,11 @@ def paper_close(sym, reason, price=None):
     print_inline()
 
 # ═══════════════════════════════════════════════════════
-#  MONITOR - INVERSE EXTREME PROFIT LOGIC
+#  MONITOR LOGIC
 # ═══════════════════════════════════════════════════════
 def monitor_positions():
-    for sym in list(paper_positions.keys()):
-        pos = paper_positions.get(sym)
+    for sym in list(live_positions.keys()):
+        pos = live_positions.get(sym)
         if pos is None or pos.get("_r"): continue
 
         px = price_live(sym)
@@ -355,45 +337,28 @@ def monitor_positions():
 
         side, entry, hold = pos["side"], pos["entry"], time.time() - pos["open_time"]
 
-        if hold >= MAX_HOLD_SEC:
-            paper_close(sym, "ForceTimeout", px); continue
-
         if side == "LONG":
             prof_pct = (px - entry) / entry
-            
             if prof_pct >= EXTREME_PROFIT_PCT:
-                paper_close(sym, "ExtremeProfit", px); continue
-                
+                live_close(sym, "ExtremeProfit", px); continue
             if prof_pct <= -HARD_SL_PCT:
-                paper_close(sym, "HardSL", px); continue
-                
-            if hold >= 5:
-                if prof_pct > 0: paper_close(sym, "ImpatientWin", px)
-                else: paper_close(sym, "ImpatientLoss", px)
-                continue
-
-            pnl_now = (px - entry) * pos["qty"]
-            print(f"  📌 {sym} L@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s [LIVE MODE]")
+                live_close(sym, "HardSL", px); continue
+            pnl_now = ((px - entry) * pos["qty"]) - (
+                ((entry * pos["qty"]) * FUTURES_FEE_PCT) + ((px * pos["qty"]) * FUTURES_FEE_PCT))
+            print(f"   📌 {sym} L@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s [DRY]")
 
         else:  # SHORT
             prof_pct = (entry - px) / entry
-            
             if prof_pct >= EXTREME_PROFIT_PCT:
-                paper_close(sym, "ExtremeProfit", px); continue
-                
+                live_close(sym, "ExtremeProfit", px); continue
             if prof_pct <= -HARD_SL_PCT:
-                paper_close(sym, "HardSL", px); continue
-                
-            if hold >= 5:
-                if prof_pct > 0: paper_close(sym, "ImpatientWin", px)
-                else: paper_close(sym, "ImpatientLoss", px)
-                continue
-
-            pnl_now = (entry - px) * pos["qty"]
-            print(f"  📌 {sym} S@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s [LIVE MODE]")
+                live_close(sym, "HardSL", px); continue
+            pnl_now = ((entry - px) * pos["qty"]) - (
+                ((entry * pos["qty"]) * FUTURES_FEE_PCT) + ((px * pos["qty"]) * FUTURES_FEE_PCT))
+            print(f"   📌 {sym} S@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s [DRY]")
 
 # ═══════════════════════════════════════════════════════
-#  SCANNER & MAIN
+#  SCANNER & THREAD ENGINE
 # ═══════════════════════════════════════════════════════
 def scan_one(sym):
     try:
@@ -429,16 +394,15 @@ def print_inline():
     n = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
     pnl, e = _stats["pnl"], "💚" if _stats["pnl"] >= 0 else "🔴"
-    print(f"     ┌ [v18.3 LIVE] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
-    print(f"     └ Ex-Profit:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']} "
-          f"Imp-Cut:{_stats['impatient_cut']} Force:{_stats['force']}")
+    print(f"      ┌ [v18.4.0 NORMAL DRY] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL Net:{pnl:+.4f}U")
+    print(f"      └ Ex-Profit:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']}")
 
 def print_full():
     n = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
     pnl, sess = _stats["pnl"], (time.time() - _stats["start"]) / 3600
     tph, e = n / sess if sess > 0 else 0, "💚" if pnl >= 0 else "🔴"
-    
+
     sh = md = 0.0
     if len(_stats["hist"]) >= 5:
         a = np.array(list(_stats["hist"]))
@@ -448,23 +412,24 @@ def print_full():
         eq = np.cumsum(list(_stats["hist"]))
         md = float(np.min(eq - np.maximum.accumulate(eq)))
 
-    print(f"\n  {'─'*62}")
-    print(f"  💸 LIVE REAL v18.3 [INVERSE EXTREME PROFIT] — {sess*60:.0f}m | {tph:.1f}T/jam")
-    print(f"  🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
-    print(f"  {e} PnL:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
-    print(f"  📐 Sharpe:{sh:.2f} MaxDD:{md:.5f}U")
-    print(f"  KS: consec={_ks['consec']} daily={_ks['daily']:+.4f} | BTC:{_macro['btc']}")
+    print(f"\n  {'─'*64}")
+    print(f"   ✅ DRY RUN LOG v18.4.0 [NORMAL — TP:0.7% SL:0.2%] — {sess*60:.0f}m | {tph:.1f}T/jam")
+    print(f"   ✅ Sinyal LONG→LONG | Sinyal SHORT→SHORT (mode normal)")
+    print(f"   🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
+    print(f"   {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
+    print(f"   📐 Sharpe:{sh:.2f} MaxDD:{md:.5f}U")
+    print(f"   KS: consec={_ks['consec']} daily={_ks['daily']:+.4f} | BTC:{_macro['btc']}")
     if trade_log:
-        print(f"  📋 Last 5:")
+        print(f"   📋 Last 5:")
         for t in trade_log[-5:]:
             em = "🟢" if t["pnl"] > 0 else "🔴"
-            print(f"     {em} {t['sym']:<14} {t['side']} {t['pnl']:+.5f}U {t['hold']}s — {t['reason']}")
-    print(f"  {'─'*62}")
+            print(f"      {em} {t['sym']:<14} {t['side']} {t['pnl']:+.5f}U {t['hold']}s — {t['reason']}")
+    print(f"  {'─'*64}")
 
 def t_monitor():
     while True:
         try:
-            if paper_positions: monitor_positions()
+            if live_positions: monitor_positions()
         except: pass
         time.sleep(MONITOR_INT)
 
@@ -473,16 +438,16 @@ def t_rescan(syms):
         try:
             _rescan_q.get(timeout=30)
             time.sleep(0.3)
-            slots = MAX_POSITIONS - len(paper_positions)
+            slots = MAX_POSITIONS - len(live_positions)
             if slots <= 0 or ks_check()[0]: continue
-            hot = [s for s in _hot_syms if s not in paper_positions]
-            rest = [s for s in syms if s not in paper_positions and s not in hot]
+            hot = [s for s in _hot_syms if s not in live_positions]
+            rest = [s for s in syms if s not in live_positions and s not in hot]
             res = scan_batch((hot + rest)[:25])
             if res:
                 for r in sorted(res, key=lambda x: x[2], reverse=True)[:slots]:
-                    if len(paper_positions) >= MAX_POSITIONS: break
+                    if len(live_positions) >= MAX_POSITIONS: break
                     sym, d, sc, sg, px, atr = r
-                    paper_open(sym, d, sc, sg, px, atr)
+                    live_open(sym, d, sc, sg, px, atr)
         except: pass
 
 def t_macro():
@@ -491,20 +456,19 @@ def t_macro():
         except: pass
         try:
             if time.time() - _macro["last_fng"] > 300:
-                _macro["fng"] = int(requests.get("https://api.alternative.me/fng/?limit=1", timeout=5).json()["data"][0]["value"])
+                _macro["fng"] = int(requests.get(
+                    "https://api.alternative.me/fng/?limit=1", timeout=5
+                ).json()["data"][0]["value"])
                 _macro["last_fng"] = time.time()
         except: pass
         time.sleep(5)
 
 def run_bot():
-    print("╔═══════════════════════════════════════════════════════╗")
-    print("║  🚀 LIVE TRADE v18.3 — INVERSE EXTREME PROFIT         ║")
-    print("║  ⚠️  WARNING: EKSEKUSI ORDER REAL KE BINANCE          ║")
-    print("╠═══════════════════════════════════════════════════════╣")
-    print(f"║  Target Profit : +{EXTREME_PROFIT_PCT*100}% (Ambil nafas / Pantulan)   ║")
-    print(f"║  Hard Stop Loss: -{HARD_SL_PCT*100}% (Mencegah terseret tren)    ║")
-    print(f"║  Impatient Cut : Hold 5s -> Profit bungkus, Minus cut ║")
-    print("╚═══════════════════════════════════════════════════════╝")
+    print("╔═══════════════════════════════════════════════════════════╗")
+    print("║  ✅ DRY RUN v18.4.0 — NORMAL MODE — TP:0.7% SL:0.2%    ║")
+    print("║  ✅ Sinyal LONG→LONG | Sinyal SHORT→SHORT (normal)       ║")
+    print("║  ⚠️  NO REAL ORDERS — SIMULATION LOGGING ONLY            ║")
+    print("╚═══════════════════════════════════════════════════════════╝")
 
     try:
         valid = {s["symbol"] for s in client.futures_exchange_info()["symbols"] if s["status"] == "TRADING"}
@@ -520,18 +484,18 @@ def run_bot():
     n_bat = math.ceil(len(syms) / BATCH_SIZE)
 
     while True:
-        cycle += 1; slots = MAX_POSITIONS - len(paper_positions)
-        print(f"\n{'═'*57}")
+        cycle += 1; slots = MAX_POSITIONS - len(live_positions)
+        print(f"\n{'═'*60}")
         print(f"  #{cycle} {time.strftime('%H:%M:%S')} BTC:{_macro['btc']} F&G:{_macro['fng']} "
-              f"({len(paper_positions)}/{MAX_POSITIONS}) PnL:{_stats['pnl']:+.4f}U")
+              f"({len(live_positions)}/{MAX_POSITIONS}) PnL Net:{_stats['pnl']:+.4f}U [NORMAL]")
 
         if (k := ks_check())[0]: print(f"  🚨 KS:{k[1]}"); time.sleep(SCAN_INTERVAL); continue
 
         if slots > 0:
             mv = top_movers(syms, 20)
-            mv = [s for s in mv if s not in paper_positions]
+            mv = [s for s in mv if s not in live_positions]
             bs = scan_idx * BATCH_SIZE
-            reg = [s for s in syms[bs:bs+BATCH_SIZE] if s not in paper_positions and s not in mv]
+            reg = [s for s in syms[bs:bs+BATCH_SIZE] if s not in live_positions and s not in mv]
             scan_idx = (scan_idx + 1) % n_bat
             scan_list = mv[:15] + reg[:10]
 
@@ -541,17 +505,17 @@ def run_bot():
             if res:
                 res.sort(key=lambda x: x[2], reverse=True)
                 for r in res[:slots]:
-                    if len(paper_positions) >= MAX_POSITIONS: break
+                    if len(live_positions) >= MAX_POSITIONS: break
                     sym, d, sc, sg, px, atr = r
                     print(f"     ⭐ {sym} {d} Score:{sc} ATR:{atr:.5g} {' | '.join(sg)}")
-                    paper_open(sym, d, sc, sg, px, atr)
-            elif len(paper_positions) == 0:
-                try: r2 = scan_batch([s for s in syms if s not in paper_positions])
+                    live_open(sym, d, sc, sg, px, atr)
+            elif len(live_positions) == 0:
+                try: r2 = scan_batch([s for s in syms if s not in live_positions])
                 except: r2 = []
                 if r2:
                     r2.sort(key=lambda x: x[2], reverse=True)
                     sym, d, sc, sg, px, atr = r2[0]
-                    paper_open(sym, d, sc, sg, px, atr)
+                    live_open(sym, d, sc, sg, px, atr)
         else: print(f"  ✅ Full ({MAX_POSITIONS}/{MAX_POSITIONS})")
 
         if cycle % 20 == 0: print_full()
