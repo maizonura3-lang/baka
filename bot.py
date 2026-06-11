@@ -43,7 +43,7 @@ client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
 LEVERAGE       = 20
 ORDER_USDT     = 2.0
-MAX_POSITIONS  = 5       # naik dari 3 → lebih banyak slot aktif
+MAX_POSITIONS  = 3       
 
 # ── TP/SL STRATEGY v18.5.0 ──────────────────────────────
 # SL = ATR-based (dinamis), bukan fixed pct
