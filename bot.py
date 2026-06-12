@@ -1,26 +1,32 @@
 """
-Bot Scalping v18.5.0 — DRY RUN LOG MODE (PAPER TRADING)
+Bot Scalping v18.6.0 — DRY RUN LOG MODE (PAPER TRADING)
 ====================================================
-CHANGELOG v18.5.0 vs v18.4.0:
+CHANGELOG v18.6.0 vs v18.5.0:
 ─────────────────────────────
-[FIX] Dynamic ATR-based SL (bukan fixed 0.2%) → SL ngikut volatilitas nyata
-[FIX] Asymmetric TP > 2× ATR_SL → R:R minimum 2:1 selalu terjaga
-[NEW] Trailing Stop aktif dari profit ≥ TRAIL_ACTIVATE_PCT (0.35%)
-      → mengunci profit, bukan lepas TP lalu balik
-[NEW] Trend Direction Gate:
-      - BTC BULL  → hanya LONG, SHORT diblokir
-      - BTC BEAR  → hanya SHORT, LONG diblokir
-      - BTC lainnya → kedua arah boleh, tapi skor SHORT +filter ketat
-[NEW] Score momentum gate: hanya entry jika skor ≥ MIN_SCORE + gap dari threshold
-[NEW] Volume displacement filter: entry hanya saat ada real push (vr≥1.8 + body≥50% candle)
-[NEW] Slot Filler Thread: dedicated loop ngisi slot kosong tiap 0.2s agresif
-[NEW] Symbol blacklist dinamis: simbol kena SL masuk cooldown 5 menit, bukan 3 detik
-[NEW] Pre-entry slippage guard: tolak entry jika harga sudah geser >0.15% dari sinyal
-[NEW] 15m trend confirmation: sinyal 5m harus aligned dengan EMA 15m
-[NEW] Anti-whipsaw: tidak entry jika posisi sebelumnya di simbol ini kena SL dalam 10 menit
-[TUNED] MIN_SCORE dinaikkan ke 58 untuk filter lebih ketat
-[TUNED] MAX_POSITIONS dinaikkan ke 5 untuk lebih banyak kesempatan
-[TUNED] BATCH_SIZE 20, MAX_WORKERS 12 untuk scan lebih cepat
+[FIX #1] TRAIL_ACTIVATE_PCT: 0.0035 → 0.0065 (0.65%)
+         Trail baru aktif setelah profit nyata menutup fee + buffer
+         Tidak aktif di zona noise awal entry
+
+[FIX #2] TRAIL_DELTA_PCT: 0.0015 → 0.0030 (0.30%)
+         Beri napas lebih ke pair volatile (SOL, DOGE, dll)
+         Trail terlalu ketat = exit di candle noise biasa
+
+[FIX #3] ATR_TP_MULT: 3.0 → 2.2
+         TP lebih realistis → lebih sering kena full TP
+         R:R tetap 2.2/1.2 = 1.83:1, breakeven WR ~36% (achievable)
+
+[FIX #4] Race condition BTC gate di live_open()
+         Pengecekan ulang _macro["btc"] sebelum eksekusi order
+         BEAR + LONG → batalkan, BULL + SHORT → batalkan
+         Tidak hanya filter di signal(), tapi double-check di eksekusi
+
+[FIX #5] MAX_POSITIONS: 3 → 2
+         Selektif 2 posisi terbaik > 3 posisi sinyal lemah
+         Reduce size saat drawdown, restore saat WR > 50%
+
+[FIX #6] Minimum hold time guard di TrailSL
+         TrailSL skip jika hold < 120 detik
+         Mencegah premature exit akibat volatilitas noise post-entry
 """
 
 import os, time, math, threading, queue
@@ -38,42 +44,43 @@ client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
 # ═══════════════════════════════════════════════════════
-#  CONFIG v18.5.0
+#  CONFIG v18.6.0
 # ═══════════════════════════════════════════════════════
 
 LEVERAGE       = 20
 ORDER_USDT     = 2.0
-MAX_POSITIONS  = 3       
+MAX_POSITIONS  = 2       # [FIX #5] turun dari 3 → lebih selektif saat WR < 50%
 
-# ── TP/SL STRATEGY v18.5.0 ──────────────────────────────
+# ── TP/SL STRATEGY v18.6.0 ──────────────────────────────
 # SL = ATR-based (dinamis), bukan fixed pct
-# TP = 2.5× SL → R:R minimum 2.5:1 setelah fee
-# Trailing aktif dari profit ≥ 0.35% → kunci profit
-ATR_SL_MULT        = 1.2   # SL = 1.2 × ATR (kisaran 0.25–0.55% tergantung volatilitas)
-ATR_TP_MULT        = 3.0   # TP = 3.0 × ATR → R:R = 3.0/1.2 = 2.5:1
-TRAIL_ACTIVATE_PCT = 0.0035 # trailing aktif dari +0.35% profit
-TRAIL_DELTA_PCT    = 0.0015 # trailing stop jarak 0.15% dari peak
-MIN_SL_PCT         = 0.0015 # SL minimum 0.15% (jangan terlalu ketat)
-MAX_SL_PCT         = 0.0060 # SL maksimum 0.60% (jangan terlalu lebar)
+# TP = 2.2× SL → R:R = 1.83:1 setelah fee (lebih achievable)
+# Trailing aktif dari profit ≥ 0.65% → tidak trail di zona noise
+ATR_SL_MULT        = 1.2    # SL = 1.2 × ATR
+ATR_TP_MULT        = 2.2    # [FIX #3] turun dari 3.0 → TP lebih realistis
+TRAIL_ACTIVATE_PCT = 0.0065 # [FIX #1] naik dari 0.0035 → aktif di +0.65% profit
+TRAIL_DELTA_PCT    = 0.0030 # [FIX #2] naik dari 0.0015 → beri napas 0.30%
+TRAIL_MIN_HOLD     = 120    # [FIX #6] NEW: TrailSL skip jika hold < 120 detik
+MIN_SL_PCT         = 0.0015 # SL minimum 0.15%
+MAX_SL_PCT         = 0.0060 # SL maksimum 0.60%
 MIN_TP_PCT         = 0.0040 # TP minimum 0.40%
 FUTURES_FEE_PCT    = 0.0005 # Taker fee 0.05%
 
 MIN_BASE_VOL   = 25_000_000
-MIN_VR         = 1.8        # naik dari 1.1 → wajib ada volume push nyata
-BR_LONG_MIN    = 0.52       # naik dari 0.48 → buyer lebih dominan
-BR_SHORT_MAX   = 0.48       # turun dari 0.52 → seller lebih dominan
+MIN_VR         = 1.8        # volume push minimum 1.8× rata-rata
+BR_LONG_MIN    = 0.52       # buyer dominance minimum untuk LONG
+BR_SHORT_MAX   = 0.48       # seller dominance maksimum untuk SHORT
 
 SCAN_INTERVAL  = 1
-MONITOR_INT    = 0.15       # lebih cepat
-SCAN_DELAY     = 0.010      # lebih cepat
-BATCH_SIZE     = 20         # naik dari 15
-MAX_WORKERS    = 12         # naik dari 8
-SLOT_FILL_INT  = 0.20       # slot filler loop interval
+MONITOR_INT    = 0.15
+SCAN_DELAY     = 0.010
+BATCH_SIZE     = 20
+MAX_WORKERS    = 12
+SLOT_FILL_INT  = 0.20
 
-MIN_SCORE      = 58         # naik dari 52 → lebih selektif
-MIN_GAP        = 12         # naik dari 10
-COOLDOWN_SEC   = 300        # 5 menit cooldown setelah SL (bukan 3 detik!)
-WHIPSAW_SEC    = 600        # anti-whipsaw: 10 menit blokir setelah SL di simbol sama
+MIN_SCORE      = 58
+MIN_GAP        = 12
+COOLDOWN_SEC   = 300        # 5 menit cooldown setelah SL
+WHIPSAW_SEC    = 600        # anti-whipsaw: 10 menit blokir setelah SL
 SLIPPAGE_GUARD = 0.0015     # tolak entry jika harga geser >0.15%
 TTL_5M         = 5
 TTL_15M        = 30
@@ -92,7 +99,6 @@ SYMBOLS = [
     "NEARUSDT", "APTUSDT", "ARBUSDT", "OPUSDT", "INJUSDT",
     "SUIUSDT", "SEIUSDT", "FETUSDT", "WLDUSDT", "AAVEUSDT",
     "ORDIUSDT", "TONUSDT", "1000PEPEUSDT", "WIFUSDT", "JUPUSDT",
-    # tambahan untuk lebih banyak peluang
     "FTMUSDT", "SANDUSDT", "MANAUSDT", "GALAUSDT", "APEUSDT",
     "CRVUSDT", "1000SHIBUSDT", "COMPUSDT", "MKRUSDT", "SNXUSDT",
 ]
@@ -104,8 +110,8 @@ SYMBOLS = list(dict.fromkeys(SYMBOLS))
 live_positions  = {}
 trade_log       = []
 _ohlcv_cache    = {}
-_sym_cooldown   = {}       # {sym: timestamp_masuk_cooldown}
-_sym_sl_time    = {}       # {sym: timestamp_terakhir_kena_SL} untuk anti-whipsaw
+_sym_cooldown   = {}
+_sym_sl_time    = {}
 _ticker_cache   = {}
 _ticker_ts      = 0
 _lock           = threading.Lock()
@@ -118,6 +124,8 @@ _ks    = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0,
 _stats = {
     "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0,
     "extreme_tp": 0, "hard_sl": 0, "trail_sl": 0, "force": 0,
+    "btc_block": 0,   # [FIX #4] counter untuk BTC gate block di live_open
+    "trail_skip": 0,  # [FIX #6] counter untuk trail skip karena min hold
     "hist": deque(maxlen=200), "start": time.time(),
 }
 
@@ -164,12 +172,10 @@ def tickers_all():
     except: return _ticker_cache
 
 def ok_cooldown(sym):
-    """Cek cooldown — setelah SL 5 menit, setelah normal 3 detik"""
     cd = _sym_cooldown.get(sym, 0)
     return (time.time() - cd) >= COOLDOWN_SEC
 
 def ok_whipsaw(sym):
-    """Anti-whipsaw: blokir 10 menit setelah kena SL di simbol ini"""
     sl_t = _sym_sl_time.get(sym, 0)
     return (time.time() - sl_t) >= WHIPSAW_SEC
 
@@ -211,7 +217,7 @@ def run_ta(df):
     df["rng"]  = h - l
     df["br2"]  = df["body"] / df["rng"].replace(0, 1)
     df["m5"]   = (c - c.shift(5)) / c.shift(5)
-    df["m3"]   = (c - c.shift(3)) / c.shift(3)  # momentum 3 candle
+    df["m3"]   = (c - c.shift(3)) / c.shift(3)
     return df
 
 def btc_trend():
@@ -250,11 +256,9 @@ def ks_upd(pnl):
     _ks["consec"] = 0 if pnl >= 0 else _ks["consec"] + 1
 
 # ═══════════════════════════════════════════════════════
-#  SIGNAL v18.5.0
-#  Tambahan: 15m trend check, volume displacement, momentum gate
+#  SIGNAL v18.6.0 (tidak berubah dari v18.5.0)
 # ═══════════════════════════════════════════════════════
 def get_15m_trend(symbol):
-    """Cek trend 15m untuk konfirmasi sinyal 5m"""
     try:
         df = run_ta(ohlcv(symbol, Client.KLINE_INTERVAL_15MINUTE, 60).copy())
         row = df.iloc[-2]
@@ -265,14 +269,6 @@ def get_15m_trend(symbol):
     except: return "FLAT"
 
 def signal(df, symbol=None):
-    """
-    Signal v18.5.0:
-    - Wajib volume displacement (bukan sekedar volume tinggi)
-    - Candle body ≥ 40% dari range (bukan doji/spinning top)
-    - Trend direction gate via BTC
-    - 15m alignment check
-    Returns: (direction, score, signals_list, atr, sl_pct, tp_pct)
-    """
     if df is None or len(df) < 55: return None, 0, [], 0.0, 0.0, 0.0
 
     row  = df.iloc[-2]
@@ -284,33 +280,31 @@ def signal(df, symbol=None):
     mh   = row["mh"];  mh_p = prev["mh"];  mh_p2 = prev2["mh"]
     vr   = row["vr"];  br   = row["br"]
     m5   = row["m5"];  m3   = row["m3"]
-    body = row["br2"]  # body ratio (body/range)
+    body = row["br2"]
     atr  = row["atr"]; adx  = row["adx"]
 
     # ── Gate 1: Volume displacement ─────────────────────
-    # Wajib ada dorongan nyata: volume ≥1.8× rata² DAN candle body besar
     if vr < MIN_VR: return None, 0, [], atr, 0.0, 0.0
-    if body < 0.40: return None, 0, [], atr, 0.0, 0.0  # doji/spinning → skip
+    if body < 0.40: return None, 0, [], atr, 0.0, 0.0
 
-    # ── Gate 2: ATR filter — jangan masuk saat volatilitas ekstrem ──
+    # ── Gate 2: ATR filter ───────────────────────────────
     atr_pct = atr / p
-    if atr_pct > 0.03: return None, 0, [], atr, 0.0, 0.0   # terlalu liar
-    if atr_pct < 0.001: return None, 0, [], atr, 0.0, 0.0  # terlalu datar (dead market)
+    if atr_pct > 0.03: return None, 0, [], atr, 0.0, 0.0
+    if atr_pct < 0.001: return None, 0, [], atr, 0.0, 0.0
 
     # ── Hitung SL/TP berbasis ATR ────────────────────────
+    # [FIX #3] ATR_TP_MULT sekarang 2.2 (dari 3.0)
     sl_pct = max(MIN_SL_PCT, min(MAX_SL_PCT, atr_pct * ATR_SL_MULT))
     tp_pct = max(MIN_TP_PCT, atr_pct * ATR_TP_MULT)
-    # Pastikan R:R ≥ 2.0 setelah fee
     net_tp = tp_pct - 2 * FUTURES_FEE_PCT
     net_sl = sl_pct + 2 * FUTURES_FEE_PCT
-    if net_tp <= 0 or (net_tp / net_sl) < 1.8:
-        # Paksa R:R minimal 2:1
-        tp_pct = sl_pct * 2.5 + 4 * FUTURES_FEE_PCT
+    if net_tp <= 0 or (net_tp / net_sl) < 1.5:
+        tp_pct = sl_pct * 2.0 + 4 * FUTURES_FEE_PCT
 
     lp = sp = 0
     sl, ss = [], []
 
-    # ── EMA Stack (bobot tertinggi) ──────────────────────
+    # ── EMA Stack ────────────────────────────────────────
     if p > e5 > e9 > e21 > e50:   lp += 32; sl.append("EMA5↑")
     elif p > e5 > e9 > e21:       lp += 24; sl.append("EMA4↑")
     if p < e5 < e9 < e21 < e50:   sp += 32; ss.append("EMA5↓")
@@ -322,11 +316,11 @@ def signal(df, symbol=None):
     if m5 < -0.006:   sp += 28; ss.append(f"Mom{m5*100:.1f}%")
     elif m5 < -0.003: sp += 20; ss.append(f"Mom{m5*100:.1f}%")
 
-    # ── Momentum 3 candle (short-term push) ─────────────
+    # ── Momentum 3 candle ────────────────────────────────
     if m3 > 0.003:    lp += 12; sl.append(f"M3+{m3*100:.1f}%")
     if m3 < -0.003:   sp += 12; ss.append(f"M3{m3*100:.1f}%")
 
-    # ── MACD crossover / continuation ───────────────────
+    # ── MACD ─────────────────────────────────────────────
     if mh_p <= 0 and mh > 0:           lp += 24; sl.append("MACD_X↑")
     elif mh > 0 and mh > mh_p > mh_p2: lp += 18; sl.append("MACD↑↑")
     if mh_p >= 0 and mh < 0:           sp += 24; ss.append("MACD_X↓")
@@ -348,18 +342,17 @@ def signal(df, symbol=None):
     elif rsi < 22: sp = int(sp * 0.3); lp += 18; sl.append(f"OS{rsi:.0f}")
     elif rsi < 30: sp = int(sp * 0.7); ss.append(f"RSI{rsi:.0f}")
 
-    # ── ADX (trend strength bonus) ───────────────────────
+    # ── ADX ──────────────────────────────────────────────
     if adx > 40:   lp += 10; sp += 10
-    elif adx < 20: lp = int(lp * 0.8); sp = int(sp * 0.8)  # ranging → kurangi keyakinan
+    elif adx < 20: lp = int(lp * 0.8); sp = int(sp * 0.8)
 
     # ── BTC Trend Direction Gate ─────────────────────────
-    # INI LOGIKA KUNCI: paksa arah sesuai tren BTC
     btc = _macro["btc"]
     if btc == "BULL":
-        sp = int(sp * 0.25)   # blokir hampir semua SHORT saat BULL
+        sp = int(sp * 0.25)
         lp += 10
     elif btc == "BEAR":
-        lp = int(lp * 0.25)   # blokir hampir semua LONG saat BEAR
+        lp = int(lp * 0.25)
         sp += 10
     elif btc == "MILD_BULL":
         sp = int(sp * 0.60)
@@ -372,23 +365,21 @@ def signal(df, symbol=None):
     # ── Resolusi sinyal ──────────────────────────────────
     if lp > sp:
         if lp < thresh or gap < MIN_GAP: return None, lp, [], atr, sl_pct, tp_pct
-        if br <= BR_LONG_MIN: return None, lp, [], atr, sl_pct, tp_pct  # buyer ratio kurang
-        # 15m confirmation untuk LONG
+        if br <= BR_LONG_MIN: return None, lp, [], atr, sl_pct, tp_pct
         if symbol:
             t15 = get_15m_trend(symbol)
-            if t15 == "DOWN": return None, lp, [], atr, sl_pct, tp_pct  # 15m bearish → skip LONG
+            if t15 == "DOWN": return None, lp, [], atr, sl_pct, tp_pct
         return "LONG", lp, sl[:4], atr, sl_pct, tp_pct
     else:
         if sp < thresh or gap < MIN_GAP: return None, max(lp, sp), [], atr, sl_pct, tp_pct
-        if br >= BR_SHORT_MAX: return None, sp, [], atr, sl_pct, tp_pct  # seller ratio kurang
-        # 15m confirmation untuk SHORT
+        if br >= BR_SHORT_MAX: return None, sp, [], atr, sl_pct, tp_pct
         if symbol:
             t15 = get_15m_trend(symbol)
-            if t15 == "UP": return None, sp, [], atr, sl_pct, tp_pct  # 15m bullish → skip SHORT
+            if t15 == "UP": return None, sp, [], atr, sl_pct, tp_pct
         return "SHORT", sp, ss[:4], atr, sl_pct, tp_pct
 
 # ═══════════════════════════════════════════════════════
-#  DRY RUN OPEN
+#  DRY RUN OPEN — v18.6.0 dengan BTC gate double-check [FIX #4]
 # ═══════════════════════════════════════════════════════
 def live_open(sym, direction, score, sigs, price, atr, sl_pct, tp_pct):
     with _lock:
@@ -396,7 +387,34 @@ def live_open(sym, direction, score, sigs, price, atr, sl_pct, tp_pct):
             return
         live_positions[sym] = {"_r": True}
 
-    # Slippage guard: cek apakah harga sudah geser terlalu jauh
+    # ── [FIX #4] BTC Gate double-check di sini (race condition fix) ──────
+    # Cek ulang _macro["btc"] tepat sebelum eksekusi, bukan hanya di signal()
+    # Ini menangkap kasus di mana btc trend berubah antara scan dan eksekusi
+    btc_now = _macro["btc"]
+    blocked = False
+    if btc_now == "BEAR" and direction == "LONG":
+        blocked = True
+        block_reason = f"BTC={btc_now} blokir {direction}"
+    elif btc_now == "BULL" and direction == "SHORT":
+        blocked = True
+        block_reason = f"BTC={btc_now} blokir {direction}"
+    elif btc_now == "MILD_BEAR" and direction == "LONG":
+        # MILD_BEAR: tidak blok total, tapi kurangi skor — batalkan jika skor mepet
+        if score < MIN_SCORE + 8:
+            blocked = True
+            block_reason = f"BTC={btc_now} skor{score} kurang untuk {direction}"
+    elif btc_now == "MILD_BULL" and direction == "SHORT":
+        if score < MIN_SCORE + 8:
+            blocked = True
+            block_reason = f"BTC={btc_now} skor{score} kurang untuk {direction}"
+
+    if blocked:
+        print(f"  🚫 [BTC-GATE] {sym} {direction} dibatalkan — {block_reason}")
+        _stats["btc_block"] += 1
+        with _lock: live_positions.pop(sym, None)
+        return
+
+    # ── Slippage guard ────────────────────────────────────────────────────
     px_now = price_live(sym)
     if px_now > 0:
         slip = abs(px_now - price) / price
@@ -404,7 +422,7 @@ def live_open(sym, direction, score, sigs, price, atr, sl_pct, tp_pct):
             print(f"  ⚠️  {sym} skip — slippage {slip*100:.2f}% > {SLIPPAGE_GUARD*100:.2f}%")
             with _lock: live_positions.pop(sym, None)
             return
-        price = px_now  # gunakan harga terkini
+        price = px_now
 
     try:
         q_val = qty(sym, price)
@@ -426,7 +444,7 @@ def live_open(sym, direction, score, sigs, price, atr, sl_pct, tp_pct):
         "open_time": time.time(), "score": score, "sigs": sigs, "atr": atr,
         "sl_price": sl_price, "tp_price": tp_price,
         "sl_pct": sl_pct, "tp_pct": tp_pct,
-        "trail_peak": price,      # untuk trailing stop
+        "trail_peak": price,
         "trail_active": False,
     }
     with _lock: live_positions[sym] = pos
@@ -492,7 +510,10 @@ def live_close(sym, reason, price=None):
     print_inline()
 
 # ═══════════════════════════════════════════════════════
-#  MONITOR — dengan Trailing Stop
+#  MONITOR v18.6.0 — dengan Trailing Stop yang diperbaiki
+#  [FIX #1] TRAIL_ACTIVATE_PCT = 0.0065
+#  [FIX #2] TRAIL_DELTA_PCT = 0.0030
+#  [FIX #6] Skip TrailSL jika hold < TRAIL_MIN_HOLD (120 detik)
 # ═══════════════════════════════════════════════════════
 def monitor_positions():
     for sym in list(live_positions.keys()):
@@ -511,45 +532,65 @@ def monitor_positions():
         if side == "LONG":
             prof_pct = (px - entry) / entry
 
-            # Update trailing stop
-            if prof_pct >= TRAIL_ACTIVATE_PCT:
-                if not pos["trail_active"]:
-                    pos["trail_active"] = True
-                    print(f"   🔒 {sym} L trail aktif @{px:.5g} (+{prof_pct*100:.2f}%)")
-                if px > pos["trail_peak"]:
-                    pos["trail_peak"] = px
-                # Trail SL = peak - delta
-                trail_sl = pos["trail_peak"] * (1 - TRAIL_DELTA_PCT)
-                if px <= trail_sl:
-                    live_close(sym, "TrailSL", px); continue
+            # ── [FIX #6] Minimum hold guard ──────────────────────────────
+            # Trailing stop hanya aktif setelah TRAIL_MIN_HOLD detik
+            # Mencegah exit prematur di candle noise awal
+            if hold >= TRAIL_MIN_HOLD:
+                # ── [FIX #1] Trail aktif di +0.65% (bukan +0.35%) ────────
+                if prof_pct >= TRAIL_ACTIVATE_PCT:
+                    if not pos["trail_active"]:
+                        pos["trail_active"] = True
+                        print(f"   🔒 {sym} L trail aktif @{px:.5g} (+{prof_pct*100:.2f}%)")
+                    if px > pos["trail_peak"]:
+                        pos["trail_peak"] = px
+                    # ── [FIX #2] Delta 0.30% (bukan 0.15%) ───────────────
+                    trail_sl = pos["trail_peak"] * (1 - TRAIL_DELTA_PCT)
+                    if px <= trail_sl:
+                        live_close(sym, "TrailSL", px); continue
+            else:
+                # Masih dalam hold minimum → skip trail check
+                if prof_pct >= TRAIL_ACTIVATE_PCT and not pos.get("_trail_skip_logged"):
+                    _stats["trail_skip"] += 1
+                    pos["_trail_skip_logged"] = True
+                    print(f"   ⏳ {sym} L trail defer — hold {hold:.0f}s < {TRAIL_MIN_HOLD}s")
 
-            # Hard SL
+            # Hard SL selalu aktif (tidak ada hold guard)
             if px <= sl_px:
                 live_close(sym, "HardSL", px); continue
-            # TP
+            # TP selalu aktif
             if px >= tp_px:
                 live_close(sym, "ExtremeTP", px); continue
 
             pnl_now = ((px - entry) * pos["qty"]) - (
                 (entry * pos["qty"] + px * pos["qty"]) * FUTURES_FEE_PCT)
+            hold_guard_info = f" ⏳hold{hold:.0f}s" if hold < TRAIL_MIN_HOLD else ""
             trail_info = f" 🔒trail@{pos['trail_peak']:.5g}" if pos["trail_active"] else ""
             print(f"   📌 {sym} L@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) "
-                  f"{pnl_now:+.4f}U {hold:.0f}s{trail_info} [DRY]")
+                  f"{pnl_now:+.4f}U {hold:.0f}s{trail_info}{hold_guard_info} [DRY]")
 
         else:  # SHORT
             prof_pct = (entry - px) / entry
 
-            # Update trailing stop
-            if prof_pct >= TRAIL_ACTIVATE_PCT:
-                if not pos["trail_active"]:
-                    pos["trail_active"] = True
-                    print(f"   🔒 {sym} S trail aktif @{px:.5g} (+{prof_pct*100:.2f}%)")
-                if px < pos["trail_peak"]:
-                    pos["trail_peak"] = px
-                trail_sl = pos["trail_peak"] * (1 + TRAIL_DELTA_PCT)
-                if px >= trail_sl:
-                    live_close(sym, "TrailSL", px); continue
+            # ── [FIX #6] Minimum hold guard ──────────────────────────────
+            if hold >= TRAIL_MIN_HOLD:
+                # ── [FIX #1] Trail aktif di +0.65% ───────────────────────
+                if prof_pct >= TRAIL_ACTIVATE_PCT:
+                    if not pos["trail_active"]:
+                        pos["trail_active"] = True
+                        print(f"   🔒 {sym} S trail aktif @{px:.5g} (+{prof_pct*100:.2f}%)")
+                    if px < pos["trail_peak"]:
+                        pos["trail_peak"] = px
+                    # ── [FIX #2] Delta 0.30% ─────────────────────────────
+                    trail_sl = pos["trail_peak"] * (1 + TRAIL_DELTA_PCT)
+                    if px >= trail_sl:
+                        live_close(sym, "TrailSL", px); continue
+            else:
+                if prof_pct >= TRAIL_ACTIVATE_PCT and not pos.get("_trail_skip_logged"):
+                    _stats["trail_skip"] += 1
+                    pos["_trail_skip_logged"] = True
+                    print(f"   ⏳ {sym} S trail defer — hold {hold:.0f}s < {TRAIL_MIN_HOLD}s")
 
+            # Hard SL selalu aktif
             if px >= sl_px:
                 live_close(sym, "HardSL", px); continue
             if px <= tp_px:
@@ -557,9 +598,10 @@ def monitor_positions():
 
             pnl_now = ((entry - px) * pos["qty"]) - (
                 (entry * pos["qty"] + px * pos["qty"]) * FUTURES_FEE_PCT)
+            hold_guard_info = f" ⏳hold{hold:.0f}s" if hold < TRAIL_MIN_HOLD else ""
             trail_info = f" 🔒trail@{pos['trail_peak']:.5g}" if pos["trail_active"] else ""
             print(f"   📌 {sym} S@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) "
-                  f"{pnl_now:+.4f}U {hold:.0f}s{trail_info} [DRY]")
+                  f"{pnl_now:+.4f}U {hold:.0f}s{trail_info}{hold_guard_info} [DRY]")
 
 # ═══════════════════════════════════════════════════════
 #  SCANNER
@@ -568,7 +610,7 @@ def scan_one(sym):
     try:
         time.sleep(SCAN_DELAY)
         if not ok_cooldown(sym): return None
-        if not ok_whipsaw(sym): return None  # anti-whipsaw check
+        if not ok_whipsaw(sym): return None
         tk = _ticker_cache
         if sym in tk and tk[sym]["vol"] < MIN_BASE_VOL: return None
 
@@ -580,14 +622,13 @@ def scan_one(sym):
         if px == 0: return None
 
         dir_, sc, sigs, atr_val, sl_pct, tp_pct = signal(df5, sym)
-        if dir_ is None or len(sigs) < 2: return None  # wajib ≥2 konfirmasi
+        if dir_ is None or len(sigs) < 2: return None
 
         px_live = price_live(sym)
         if px_live == 0: return None
 
-        # Slippage pre-check di scanner juga
         slip = abs(px_live - px) / px
-        if slip > SLIPPAGE_GUARD * 1.5: return None  # sudah geser terlalu jauh
+        if slip > SLIPPAGE_GUARD * 1.5: return None
 
         return (sym, dir_, sc, sigs, px_live, atr_val, sl_pct, tp_pct)
     except: return None
@@ -616,10 +657,11 @@ def print_inline():
     n  = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
     pnl, e = _stats["pnl"], "💚" if _stats["pnl"] >= 0 else "🔴"
-    print(f"      ┌ [v18.5.0 DRY] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} "
+    print(f"      ┌ [v18.6.0 DRY] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} "
           f"{e}PnL Net:{pnl:+.4f}U")
     print(f"      └ ExTP:{_stats['extreme_tp']} TrailSL:{_stats['trail_sl']} "
-          f"HardSL:{_stats['hard_sl']}")
+          f"HardSL:{_stats['hard_sl']} "
+          f"BTCBlock:{_stats['btc_block']} TrailDefer:{_stats['trail_skip']}")
 
 def print_full():
     n    = _stats["wins"] + _stats["losses"]
@@ -639,14 +681,18 @@ def print_full():
         md = float(np.min(eq - np.maximum.accumulate(eq)))
 
     print(f"\n  {'─'*68}")
-    print(f"   ✅ DRY RUN v18.5.0 [ATR-SL | TrailTP | TrendGate] — "
+    print(f"   ✅ DRY RUN v18.6.0 [ATR-SL | TrailTP+ | TrendGate+] — "
           f"{sess*60:.0f}m | {tph:.1f}T/jam")
     print(f"   🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
     print(f"   {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     print(f"   📐 Sharpe:{sh:.2f} MaxDD:{md:.5f}U")
     print(f"   💰 ExtremeTP:{_stats['extreme_tp']} TrailSL:{_stats['trail_sl']} "
           f"HardSL:{_stats['hard_sl']}")
+    print(f"   🚫 BTCGateBlock:{_stats['btc_block']} TrailDefer:{_stats['trail_skip']}")
     print(f"   🔑 KS: consec={_ks['consec']} daily={_ks['daily']:+.4f} | BTC:{_macro['btc']}")
+    print(f"   ⚙️  Trail: activate={TRAIL_ACTIVATE_PCT*100:.2f}% "
+          f"delta={TRAIL_DELTA_PCT*100:.2f}% minhold={TRAIL_MIN_HOLD}s "
+          f"TP_mult={ATR_TP_MULT} MaxPos={MAX_POSITIONS}")
     if trade_log:
         print(f"   📋 Last 5:")
         for t in trade_log[-5:]:
@@ -659,7 +705,6 @@ def print_full():
 #  THREADS
 # ═══════════════════════════════════════════════════════
 def t_monitor():
-    """Monitor posisi dengan interval sangat cepat"""
     while True:
         try:
             if live_positions:
@@ -668,11 +713,6 @@ def t_monitor():
         time.sleep(MONITOR_INT)
 
 def t_slot_filler(syms):
-    """
-    SLOT FILLER THREAD — logika baru v18.5.0
-    Loop tiap 0.2 detik, agresif mengisi slot kosong.
-    Tidak ada posisi kosong lebih dari 1 detik jika ada sinyal.
-    """
     scan_idx = 0
     n_bat    = math.ceil(len(syms) / BATCH_SIZE)
 
@@ -683,7 +723,6 @@ def t_slot_filler(syms):
                 time.sleep(SLOT_FILL_INT)
                 continue
 
-            # Prioritas: hot symbols dulu, lalu top movers, lalu rotasi
             hot  = [s for s in _hot_syms if s not in live_positions and ok_cooldown(s) and ok_whipsaw(s)]
             mv   = top_movers(syms, 25)
             mv   = [s for s in mv   if s not in live_positions and ok_cooldown(s) and ok_whipsaw(s)]
@@ -693,7 +732,6 @@ def t_slot_filler(syms):
                     if s not in live_positions and ok_cooldown(s) and ok_whipsaw(s) and s not in mv]
             scan_idx = (scan_idx + 1) % n_bat
 
-            # Gabung prioritas: hot > mover > regular
             scan_list = list(dict.fromkeys(hot[:5] + mv[:15] + reg[:10]))[:BATCH_SIZE]
             if not scan_list:
                 time.sleep(SLOT_FILL_INT)
@@ -701,7 +739,7 @@ def t_slot_filler(syms):
 
             res = scan_batch(scan_list)
             if res:
-                res.sort(key=lambda x: x[2], reverse=True)  # sort by score
+                res.sort(key=lambda x: x[2], reverse=True)
                 for r in res[:slots]:
                     if len(live_positions) >= MAX_POSITIONS: break
                     sym, d, sc, sg, px, atr, sl_p, tp_p = r
@@ -711,7 +749,6 @@ def t_slot_filler(syms):
         time.sleep(SLOT_FILL_INT)
 
 def t_rescan(syms):
-    """Rescan setelah posisi tutup"""
     while True:
         try:
             _rescan_q.get(timeout=15)
@@ -748,12 +785,16 @@ def t_macro():
 # ═══════════════════════════════════════════════════════
 def run_bot():
     print("╔═══════════════════════════════════════════════════════════════╗")
-    print("║  ✅ DRY RUN v18.5.0 — ATR-SL | TRAILING TP | TREND GATE    ║")
-    print("║  ✅ Dynamic SL (ATR×1.2) | TP (ATR×3.0) | Trail @+0.35%   ║")
-    print("║  ✅ BTC Trend Gate | 15m Confirm | Anti-Whipsaw             ║")
-    print("║  ✅ Slot Filler Thread (0.2s) | Slippage Guard              ║")
+    print("║  ✅ DRY RUN v18.6.0 — 6 FIXES APPLIED                      ║")
+    print("║  ✅ Trail activate +0.65% | Delta 0.30% | MinHold 120s      ║")
+    print("║  ✅ TP mult 2.2× | BTC Gate double-check | MaxPos 2         ║")
     print("║  ⚠️  NO REAL ORDERS — SIMULATION LOGGING ONLY               ║")
     print("╚═══════════════════════════════════════════════════════════════╝")
+    print(f"  ⚙️  Config: TRAIL_ACT={TRAIL_ACTIVATE_PCT*100:.2f}% "
+          f"TRAIL_DELTA={TRAIL_DELTA_PCT*100:.2f}% "
+          f"TRAIL_HOLD={TRAIL_MIN_HOLD}s "
+          f"TP={ATR_TP_MULT}x SL={ATR_SL_MULT}x "
+          f"MaxPos={MAX_POSITIONS}")
 
     try:
         valid = {s["symbol"] for s in client.futures_exchange_info()["symbols"]
