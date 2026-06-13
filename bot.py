@@ -1,12 +1,11 @@
 """
-Bot Scalping v19.0.0 — DRY RUN LOG MODE (PAPER TRADING)
+Bot Scalping v19.1.0 — DRY RUN LOG MODE (PAPER TRADING)
 ====================================================
-MODIFIKASI TERBARU:
-- Fixed TP & SL dikunci pada 0.15% (menutup fee 0.1% masuk-keluar)
-- Logika Sinyal Terbalik (Sinyal LONG jadi SHORT, Sinyal SHORT jadi LONG)
-- Hapus Trailing Stop, Timeout, Cooldown, & Hambatan Analisa
-- Mode Spam Posisi Aktif Cepat (Slot Filler dipercepat, Maksimal 3 Posisi)
-- Size per Posisi tetap 2 USD
+MODIFIKASI v19.1.0 (ANTI-ASYMMETRIC LOSS):
+- Persentase TP & SL dinaikkan ke 0.25% agar bernapas keluar dari noise
+- Jarak harga TP dan SL disamakan presisi (Gross R:R 1:1 murni di chart)
+- Perhitungan PnL Net sudah otomatis memotong fee masuk & keluar (0.1% total)
+- Memperketat SLIPPAGE_GUARD agar eksekusi posisi tidak melompat terlalu jauh
 """
 
 import os, time, math, threading, queue
@@ -24,28 +23,28 @@ client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
 # ═══════════════════════════════════════════════════════
-#  CONFIG v19.0.0
+#  CONFIG v19.1.0
 # ═══════════════════════════════════════════════════════
 
 LEVERAGE       = 20
 ORDER_USDT     = 2.0
-MAX_POSITIONS  = 3  # Diubah ke maksimal 3 posisi sesuai request
+MAX_POSITIONS  = 3 
 
-# ── TP/SL STRATEGY v19.0.0 (FIXED 0.15%) ────────────────
-FIXED_TP_SL_PCT = 0.0015  # Ditargetkan sama besar 0.15%
+# ── TP/SL STRATEGY v19.1.0 (DIURUTKAN & DISAMAKAN) ──────
+FIXED_TP_SL_PCT = 0.0025  # Dinaikkan ke 0.25% agar 1 win sebanding dengan 1 loss setelah fee
 FUTURES_FEE_PCT = 0.0005  # Taker fee binance 0.05% (Masuk + Keluar = 0.1%)
 
-SCAN_INTERVAL  = 0.2     # Dipercepat dari 1s ke 0.2s untuk fast scanning
-MONITOR_INT    = 0.05    # Pengawasan posisi diperketat tanpa delay berarti
-SCAN_DELAY     = 0.002   # Diperkecil untuk meminimalkan jeda antar koin
-BATCH_SIZE     = 40      # Memperbesar batch agar scanning mencakup banyak token sekaligus
-MAX_WORKERS    = 20      # Meningkatkan performa multi-threading
-SLOT_FILL_INT  = 0.01    # Mengurangi waktu tunggu pengisian posisi kosong agar selalu spam
+SCAN_INTERVAL  = 0.2     
+MONITOR_INT    = 0.05    
+SCAN_DELAY     = 0.002   
+BATCH_SIZE     = 40      
+MAX_WORKERS    = 20      
+SLOT_FILL_INT  = 0.01    
 
-MIN_SCORE      = 50      # Menurunkan ambang batas skor agar posisi cepat terisi
+MIN_SCORE      = 50      
 MIN_GAP        = 5
-SLIPPAGE_GUARD = 0.0050  # Dilonggarkan sedikit agar eksekusi spam lancar
-TTL_5M         = 2       # Cache dipersingkat agar data selalu fresh dari market
+SLIPPAGE_GUARD = 0.0015  # Diperketat kembali ke 0.15% agar harga entry tidak lompat jauh
+TTL_5M         = 2       
 
 DAILY_LOSS     = -20.0
 CONSEC_MAX     = 15
@@ -201,7 +200,7 @@ def ks_upd(pnl):
     _ks["consec"] = 0 if pnl >= 0 else _ks["consec"] + 1
 
 # ═══════════════════════════════════════════════════════
-#  SIGNAL v19.0.0
+#  SIGNAL v19.1.0 (REVERSE ENGINE)
 # ═══════════════════════════════════════════════════════
 def signal(df, symbol=None):
     if df is None or len(df) < 55: return None, 0, [], 0.0, 0.0, 0.0
@@ -214,42 +213,35 @@ def signal(df, symbol=None):
     rsi  = row["rsi"]
     mh   = row["mh"];  mh_p = prev["mh"];  mh_p2 = prev2["mh"]
     vr   = row["vr"];  br   = row["br"]
-    m5   = row["m5"];  m3   = row["m3"]
+    m5   = row["m5"]
     body = row["br2"]
-    atr  = row["atr"]; adx  = row["adx"]
+    atr  = row["atr"]
 
-    # Menghapus filter volume keras dan filter kerumitan tubuh lilin untuk melancarkan spamming posisi cepat
     if body < 0.15: return None, 0, [], atr, 0.0, 0.0
 
     lp = sp = 0
     sl, ss = [], []
 
-    # ── EMA Stack ────────────────────────────────────────
     if p > e5 > e9 > e21 > e50:   lp += 32; sl.append("EMA5↑")
     elif p > e5 > e9 > e21:       lp += 24; sl.append("EMA4↑")
     if p < e5 < e9 < e21 < e50:   sp += 32; ss.append("EMA5↓")
     elif p < e5 < e9 < e21:       sp += 24; ss.append("EMA4↓")
 
-    # ── Momentum ─────────────────────────────────────────
     if m5 > 0.002:   lp += 28; sl.append(f"Mom+{m5*100:.1f}%")
     if m5 < -0.002:  sp += 28; ss.append(f"Mom{m5*100:.1f}%")
 
-    # ── MACD ─────────────────────────────────────────────
     if mh_p <= 0 and mh > 0:           lp += 24; sl.append("MACD_X↑")
     elif mh > 0 and mh > mh_p > mh_p2: lp += 18; sl.append("MACD↑↑")
     if mh_p >= 0 and mh < 0:           sp += 24; ss.append("MACD_X↓")
     elif mh < 0 and mh < mh_p < mh_p2: sp += 18; ss.append("MACD↓↓")
 
-    # ── Buyer/Seller dominance ───────────────────────────
     if br > 0.52:   lp += 22; sl.append(f"Buy{br:.0%}")
     if br < 0.48:   sp += 22; ss.append(f"Sell{1-br:.0%}")
 
     thresh = MIN_SCORE
     gap    = abs(lp - sp)
 
-    # ── REVERSE LOGIC ENGINE ─────────────────────────────
-    # Jika analisa mengarah LONG -> Bot mengeksekusi SHORT.
-    # Jika analisa mengarah SHORT -> Bot mengeksekusi LONG.
+    # REVERSE: Analisa LONG -> Masuk SHORT. Analisa SHORT -> Masuk LONG.
     if lp > sp:
         if lp < thresh or gap < MIN_GAP: return None, lp, [], atr, 0.0, 0.0
         return "SHORT", lp, sl[:4], atr, FIXED_TP_SL_PCT, FIXED_TP_SL_PCT
@@ -266,7 +258,6 @@ def live_open(sym, direction, score, sigs, price, atr, sl_pct, tp_pct):
             return
         live_positions[sym] = {"_r": True}
 
-    # Slippage guard disesuaikan tipis untuk fast-entry spam mode
     px_now = price_live(sym)
     if px_now > 0:
         slip = abs(px_now - price) / price
@@ -281,7 +272,7 @@ def live_open(sym, direction, score, sigs, price, atr, sl_pct, tp_pct):
         with _lock: live_positions.pop(sym, None)
         return
 
-    # Menghitung level TP/SL absolut berdasarkan FIXED 0.15% target
+    # Jarak persentase dari harga entry dikunci mutlak sama besar (0.25%)
     if direction == "LONG":
         sl_price = price * (1 - sl_pct)
         tp_price = price * (1 + tp_pct)
@@ -302,7 +293,7 @@ def live_open(sym, direction, score, sigs, price, atr, sl_pct, tp_pct):
     _stats["trades"] += 1
 
 # ═══════════════════════════════════════════════════════
-#  DRY RUN CLOSE
+#  DRY RUN CLOSE (Sudah include Potongan Fee Masuk-Keluar)
 # ═══════════════════════════════════════════════════════
 def live_close(sym, reason, price=None):
     with _lock:
@@ -314,10 +305,15 @@ def live_close(sym, reason, price=None):
 
     side, entry, q_val = pos["side"], pos["entry"], pos["qty"]
 
+    # Gross PnL sebelum dipotong komisi exchange
     gross_pnl = (price - entry) * q_val if side == "LONG" else (entry - price) * q_val
+    
+    # Penghitungan Fee Masuk (0.05%) & Keluar (0.05%) secara realitas akurat
     open_fee  = (entry * q_val) * FUTURES_FEE_PCT
     close_fee = (price * q_val) * FUTURES_FEE_PCT
     total_fee = open_fee + close_fee
+    
+    # Net PnL = Hasil bersih setelah dikurangi semua fee masuk & keluar
     pnl = gross_pnl - total_fee
 
     pct   = (price - entry) / entry * 100 if side == "LONG" else (entry - price) / entry * 100
@@ -350,7 +346,7 @@ def live_close(sym, reason, price=None):
     print_inline()
 
 # ═══════════════════════════════════════════════════════
-#  MONITOR POSITIONS (Trailing Stop & Timeout Dihapus)
+#  MONITOR POSITIONS
 # ═══════════════════════════════════════════════════════
 def monitor_positions():
     for sym in list(live_positions.keys()):
@@ -431,7 +427,7 @@ def print_inline():
     n  = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
     pnl, e = _stats["pnl"], "💚" if _stats["pnl"] >= 0 else "🔴"
-    print(f"       ┌ [v19.0.0 DRY] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL Net:{pnl:+.4f}U")
+    print(f"       ┌ [v19.1.0 DRY] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL Net:{pnl:+.4f}U")
     print(f"       └ ExTP:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']}")
 
 def print_full():
@@ -443,7 +439,7 @@ def print_full():
     e    = "💚" if pnl >= 0 else "🔴"
 
     print(f"\n  {'─'*68}")
-    print(f"    ✅ DRY RUN v19.0.0 [FIXED 0.15% TP/SL | REVERSE LOGIC | SPAM POSITION]")
+    print(f"    ✅ DRY RUN v19.1.0 [FIXED 0.25% TP/SL | COUPLING BALANCE | SPAM MODE]")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
     print(f"    {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     print(f"    💰 ExtremeTP:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']}")
@@ -531,11 +527,10 @@ def t_macro():
 # ═══════════════════════════════════════════════════════
 def run_bot():
     print("╔═══════════════════════════════════════════════════════════════╗")
-    print("║  ✅ DRY RUN v19.0.0 — SPAM & REVERSE MODE                     ║")
-    print("║  ✅ Fixed TP & SL locked at 0.15% (1 profit covers 1 loss)   ║")
-    print("║  ✅ Logic Reverse: Long Analysa -> Short entry & vice-versa   ║")
-    print("║  ✅ Trailing Stop & Timeout Removed entirely                  ║")
-    print("║  ✅ Open Position Max = 3 Slots | $2.0 per Position           ║")
+    print("║  ✅ DRY RUN v19.1.0 — FIXED TARGET MOVED UP TO 0.25%          ║")
+    print("║  ✅ Jarak TP dan SL di chart dikunci SAMA PRESISI 1:1          ║")
+    print("║  ✅ PnL bersih otomatis memotong fee masuk & keluar (0.1%)   ║")
+    print("║  ✅ Slippage diperketat agar HardSL tidak melompat jauh       ║")
     print("╚═══════════════════════════════════════════════════════════════╝")
 
     try:
@@ -544,7 +539,7 @@ def run_bot():
     except:
         syms  = list(dict.fromkeys(SYMBOLS))
 
-    print(f"  📋 {len(syms)} simbol aktif siap di spam")
+    print(f"  📋 {len(syms)} simbol aktif siap dieksekusi cepat")
 
     threading.Thread(target=t_monitor,         daemon=True).start()
     threading.Thread(target=t_slot_filler, args=(syms,), daemon=True).start()
@@ -564,9 +559,9 @@ def run_bot():
         if (k := ks_check())[0]:
             print(f"  🚨 KS:{k[1]}")
         elif slots == 0:
-            print(f"  ✅ Full ({MAX_POSITIONS}/{MAX_POSITIONS}) — Mengawasi ketat level keluar...")
+            print(f"  ✅ Full Positions ({MAX_POSITIONS}/{MAX_POSITIONS}) — Slot penuh")
         else:
-            print(f"  🔍 {slots} slot kosong — Spamming scan dipercepat...")
+            print(f"  🔍 {slots} slot kosong — Scanning market cepat...")
 
         if cycle % 30 == 0:
             print_full()
