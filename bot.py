@@ -1,11 +1,10 @@
 """
-Bot Scalping v19.1.0 — DRY RUN LOG MODE (PAPER TRADING)
+Bot Scalping v19.2.0 — DRY RUN LOG MODE (PAPER TRADING)
 ====================================================
-MODIFIKASI v19.1.0 (ANTI-ASYMMETRIC LOSS):
-- Persentase TP & SL dinaikkan ke 0.25% agar bernapas keluar dari noise
-- Jarak harga TP dan SL disamakan presisi (Gross R:R 1:1 murni di chart)
-- Perhitungan PnL Net sudah otomatis memotong fee masuk & keluar (0.1% total)
-- Memperketat SLIPPAGE_GUARD agar eksekusi posisi tidak melompat terlalu jauh
+MODIFIKASI v19.2.0:
+- Persentase TP & SL dinaikkan ke 0.40% untuk mengecilkan dampak fee exchange
+- Jarak harga TP dan SL dikunci mati 1:1 murni pada persentase baru
+- Logika reverse tetap aktif, slot spam 3 posisi, size tetap 2 USD
 """
 
 import os, time, math, threading, queue
@@ -23,16 +22,16 @@ client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
 # ═══════════════════════════════════════════════════════
-#  CONFIG v19.1.0
+#  CONFIG v19.2.0
 # ═══════════════════════════════════════════════════════
 
 LEVERAGE       = 20
 ORDER_USDT     = 2.0
 MAX_POSITIONS  = 3 
 
-# ── TP/SL STRATEGY v19.1.0 (DIURUTKAN & DISAMAKAN) ──────
-FIXED_TP_SL_PCT = 0.0025  # Dinaikkan ke 0.25% agar 1 win sebanding dengan 1 loss setelah fee
-FUTURES_FEE_PCT = 0.0005  # Taker fee binance 0.05% (Masuk + Keluar = 0.1%)
+# ── TP/SL STRATEGY v19.2.0 (DITINGKATKAN KE 0.40%) ──────
+FIXED_TP_SL_PCT = 0.0040  # Dinaikkan ke 0.40% agar dampak fee mengecil terhadap net profit
+FUTURES_FEE_PCT = 0.0005  # Taker fee 0.05% (Total masuk + keluar = 0.1%)
 
 SCAN_INTERVAL  = 0.2     
 MONITOR_INT    = 0.05    
@@ -43,7 +42,7 @@ SLOT_FILL_INT  = 0.01
 
 MIN_SCORE      = 50      
 MIN_GAP        = 5
-SLIPPAGE_GUARD = 0.0015  # Diperketat kembali ke 0.15% agar harga entry tidak lompat jauh
+SLIPPAGE_GUARD = 0.0015  # Tetap ketat di 0.15% agar eksekusi rapi
 TTL_5M         = 2       
 
 DAILY_LOSS     = -20.0
@@ -200,7 +199,7 @@ def ks_upd(pnl):
     _ks["consec"] = 0 if pnl >= 0 else _ks["consec"] + 1
 
 # ═══════════════════════════════════════════════════════
-#  SIGNAL v19.1.0 (REVERSE ENGINE)
+#  SIGNAL v19.2.0 (REVERSE ENGINE)
 # ═══════════════════════════════════════════════════════
 def signal(df, symbol=None):
     if df is None or len(df) < 55: return None, 0, [], 0.0, 0.0, 0.0
@@ -241,7 +240,7 @@ def signal(df, symbol=None):
     thresh = MIN_SCORE
     gap    = abs(lp - sp)
 
-    # REVERSE: Analisa LONG -> Masuk SHORT. Analisa SHORT -> Masuk LONG.
+    # REVERSE LOGIC
     if lp > sp:
         if lp < thresh or gap < MIN_GAP: return None, lp, [], atr, 0.0, 0.0
         return "SHORT", lp, sl[:4], atr, FIXED_TP_SL_PCT, FIXED_TP_SL_PCT
@@ -272,7 +271,6 @@ def live_open(sym, direction, score, sigs, price, atr, sl_pct, tp_pct):
         with _lock: live_positions.pop(sym, None)
         return
 
-    # Jarak persentase dari harga entry dikunci mutlak sama besar (0.25%)
     if direction == "LONG":
         sl_price = price * (1 - sl_pct)
         tp_price = price * (1 + tp_pct)
@@ -293,7 +291,7 @@ def live_open(sym, direction, score, sigs, price, atr, sl_pct, tp_pct):
     _stats["trades"] += 1
 
 # ═══════════════════════════════════════════════════════
-#  DRY RUN CLOSE (Sudah include Potongan Fee Masuk-Keluar)
+#  DRY RUN CLOSE
 # ═══════════════════════════════════════════════════════
 def live_close(sym, reason, price=None):
     with _lock:
@@ -305,15 +303,10 @@ def live_close(sym, reason, price=None):
 
     side, entry, q_val = pos["side"], pos["entry"], pos["qty"]
 
-    # Gross PnL sebelum dipotong komisi exchange
     gross_pnl = (price - entry) * q_val if side == "LONG" else (entry - price) * q_val
-    
-    # Penghitungan Fee Masuk (0.05%) & Keluar (0.05%) secara realitas akurat
     open_fee  = (entry * q_val) * FUTURES_FEE_PCT
     close_fee = (price * q_val) * FUTURES_FEE_PCT
     total_fee = open_fee + close_fee
-    
-    # Net PnL = Hasil bersih setelah dikurangi semua fee masuk & keluar
     pnl = gross_pnl - total_fee
 
     pct   = (price - entry) / entry * 100 if side == "LONG" else (entry - price) / entry * 100
@@ -427,7 +420,7 @@ def print_inline():
     n  = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
     pnl, e = _stats["pnl"], "💚" if _stats["pnl"] >= 0 else "🔴"
-    print(f"       ┌ [v19.1.0 DRY] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL Net:{pnl:+.4f}U")
+    print(f"       ┌ [v19.2.0 DRY] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL Net:{pnl:+.4f}U")
     print(f"       └ ExTP:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']}")
 
 def print_full():
@@ -439,7 +432,7 @@ def print_full():
     e    = "💚" if pnl >= 0 else "🔴"
 
     print(f"\n  {'─'*68}")
-    print(f"    ✅ DRY RUN v19.1.0 [FIXED 0.25% TP/SL | COUPLING BALANCE | SPAM MODE]")
+    print(f"    ✅ DRY RUN v19.2.0 [FIXED 0.40% TP/SL | REDUCE FEE IMPACT | SPAM MODE]")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
     print(f"    {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     print(f"    💰 ExtremeTP:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']}")
@@ -527,10 +520,9 @@ def t_macro():
 # ═══════════════════════════════════════════════════════
 def run_bot():
     print("╔═══════════════════════════════════════════════════════════════╗")
-    print("║  ✅ DRY RUN v19.1.0 — FIXED TARGET MOVED UP TO 0.25%          ║")
+    print("║  ✅ DRY RUN v19.2.0 — TARGET MOVED TO 0.40%                   ║")
+    print("║  ✅ Menghindari asimetri loss akibat potongan taker fee       ║")
     print("║  ✅ Jarak TP dan SL di chart dikunci SAMA PRESISI 1:1          ║")
-    print("║  ✅ PnL bersih otomatis memotong fee masuk & keluar (0.1%)   ║")
-    print("║  ✅ Slippage diperketat agar HardSL tidak melompat jauh       ║")
     print("╚═══════════════════════════════════════════════════════════════╝")
 
     try:
@@ -539,7 +531,7 @@ def run_bot():
     except:
         syms  = list(dict.fromkeys(SYMBOLS))
 
-    print(f"  📋 {len(syms)} simbol aktif siap dieksekusi cepat")
+    print(f"  📋 {len(syms)} simbol aktif terpantau")
 
     threading.Thread(target=t_monitor,         daemon=True).start()
     threading.Thread(target=t_slot_filler, args=(syms,), daemon=True).start()
@@ -559,9 +551,9 @@ def run_bot():
         if (k := ks_check())[0]:
             print(f"  🚨 KS:{k[1]}")
         elif slots == 0:
-            print(f"  ✅ Full Positions ({MAX_POSITIONS}/{MAX_POSITIONS}) — Slot penuh")
+            print(f"  ✅ Slots full")
         else:
-            print(f"  🔍 {slots} slot kosong — Scanning market cepat...")
+            print(f"  🔍 {slots} slot kosong — Fast scanning...")
 
         if cycle % 30 == 0:
             print_full()
