@@ -1,10 +1,10 @@
 """
-Bot Scalping v19.3.0 — DRY RUN LOG MODE (PAPER TRADING)
+Bot Scalping v19.4.0 — DRY RUN LOG MODE (PAPER TRADING)
 ====================================================
-MODIFIKASI v19.3.0:
-- Target TP dikunci pada 0.50%
-- Target SL dikunci pada 0.20%
-- Logika reverse tetap aktif, slot spam 3 posisi, size tetap 2 USD
+MODIFIKASI v19.4.0:
+- Arah posisi entry dikembalikan ke normal (Sinyal LONG buka LONG, Sinyal SHORT buka SHORT)
+- Target TP tetap dikunci pada 0.50% dan Target SL dikunci pada 0.20%
+- Slot spam tetap 3 posisi, size per order tetap 2 USD
 """
 
 import os, time, math, threading, queue
@@ -22,16 +22,16 @@ client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
 # ═══════════════════════════════════════════════════════
-#  CONFIG v19.3.0
+#  CONFIG v19.4.0
 # ═══════════════════════════════════════════════════════
 
 LEVERAGE       = 20
 ORDER_USDT     = 2.0
 MAX_POSITIONS  = 3 
 
-# ── TP/SL STRATEGY v19.3.0 (ASIMETRIS FIXED) ────────────────
-FIXED_TP_PCT    = 0.0050  # Ditetapkan 0.5% sesuai request
-FIXED_SL_PCT    = 0.0020  # Ditetapkan 0.2% sesuai request
+# ── TP/SL STRATEGY v19.4.0 (ASIMETRIS FIXED) ────────────────
+FIXED_TP_PCT    = 0.0050  # 0.5%
+FIXED_SL_PCT    = 0.0020  # 0.2%
 FUTURES_FEE_PCT = 0.0005  # Taker fee 0.05% (Total masuk + keluar = 0.1%)
 
 SCAN_INTERVAL  = 0.2     
@@ -200,7 +200,7 @@ def ks_upd(pnl):
     _ks["consec"] = 0 if pnl >= 0 else _ks["consec"] + 1
 
 # ═══════════════════════════════════════════════════════
-#  SIGNAL v19.3.0 (REVERSE ENGINE)
+#  SIGNAL v19.4.0 (NORMAL ENGINE)
 # ═══════════════════════════════════════════════════════
 def signal(df, symbol=None):
     if df is None or len(df) < 55: return None, 0, [], 0.0, 0.0, 0.0
@@ -241,13 +241,13 @@ def signal(df, symbol=None):
     thresh = MIN_SCORE
     gap    = abs(lp - sp)
 
-    # REVERSE LOGIC dengan keluaran target terpisah
+    # ARAH DIREKTIF NORMAL: Analisa LONG -> Open LONG. Analisa SHORT -> Open SHORT.
     if lp > sp:
         if lp < thresh or gap < MIN_GAP: return None, lp, [], atr, 0.0, 0.0
-        return "SHORT", lp, sl[:4], atr, FIXED_SL_PCT, FIXED_TP_PCT
+        return "LONG", lp, sl[:4], atr, FIXED_SL_PCT, FIXED_TP_PCT
     else:
         if sp < thresh or gap < MIN_GAP: return None, max(lp, sp), [], atr, 0.0, 0.0
-        return "LONG", sp, ss[:4], atr, FIXED_SL_PCT, FIXED_TP_PCT
+        return "SHORT", sp, ss[:4], atr, FIXED_SL_PCT, FIXED_TP_PCT
 
 # ═══════════════════════════════════════════════════════
 #  DRY RUN OPEN
@@ -421,7 +421,7 @@ def print_inline():
     n  = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
     pnl, e = _stats["pnl"], "💚" if _stats["pnl"] >= 0 else "🔴"
-    print(f"       ┌ [v19.3.0 DRY] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL Net:{pnl:+.4f}U")
+    print(f"       ┌ [v19.4.0 DRY] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL Net:{pnl:+.4f}U")
     print(f"       └ ExTP:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']}")
 
 def print_full():
@@ -433,7 +433,7 @@ def print_full():
     e    = "💚" if pnl >= 0 else "🔴"
 
     print(f"\n  {'─'*68}")
-    print(f"    ✅ DRY RUN v19.3.0 [TP 0.50% | SL 0.20% | SPAM MODE]")
+    print(f"    ✅ DRY RUN v19.4.0 [TP 0.50% | SL 0.20% | NORMAL ENTRY MODE]")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
     print(f"    {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     print(f"    💰 ExtremeTP:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']}")
@@ -521,7 +521,7 @@ def t_macro():
 # ═══════════════════════════════════════════════════════
 def run_bot():
     print("╔═══════════════════════════════════════════════════════════════╗")
-    print("║  ✅ DRY RUN v19.3.0 — ASYMMETRIC FIXED TP/SL ACTIVATED        ║")
+    print("║  ✅ DRY RUN v19.4.0 — NORMAL DIRECTION ENTRY ENGINE           ║")
     print("║  ✅ Target Take Profit diatur ketat: 0.50%                     ║")
     print("║  ✅ Target Stop Loss diatur ketat: 0.20%                       ║")
     print("╚═══════════════════════════════════════════════════════════════╝")
