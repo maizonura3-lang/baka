@@ -1,13 +1,12 @@
 """
-Bot Scalping Quant v20.0.0 — HFT & EXPECTANCY OPTIMIZED
-====================================================
-MODIFIKASI:
-- Strict Entry Filtering (EMA, ADX>22, Vol>1.3, MACD Hist, RSI)
-- BTC Macro Directional Lock
-- ATR Dynamic TP/SL (RR Net > 1:2.5)
-- Auto Break Even & 2-Stage Trailing Profit
-- Smart Score & Loss Detection System (Auto-Block)
-- Drawdown Protection & Cooldown Management
+Bot Scalping Quant v20.1.0 — HIGH WIN RATE & FEE COVERAGE
+==========================================================
+MODIFIKASI WIN RATE:
+- TP/SL lebih pendek (ATR multiplier rendah) -> win rate tinggi
+- Minimal TP menutup fee round-trip (0.1%)
+- Filter lebih longgar tapi tetap disiplin
+- Break Even & Trailing di level rendah
+- Profit Protection lebih responsif
 """
 
 import os, time, math, threading, queue
@@ -22,16 +21,15 @@ import numpy as np
 
 load_dotenv()
 client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
-client.FUTURES_URL = "https://fapi.binance.com/fapi" # Ganti ke mainnet jika sudah siap
+client.FUTURES_URL = "https://fapi.binance.com/fapi"
 
 # ═══════════════════════════════════════════════════════
-#  CONFIG v20.0.0
+#  CONFIG v20.1.0
 # ═══════════════════════════════════════════════════════
-
 LEVERAGE       = 20
 ORDER_USDT     = 2.0
 MAX_POSITIONS  = 3 
-FUTURES_FEE_PCT = 0.0005  # Taker fee 0.05% (Round trip = 0.10%)
+FUTURES_FEE_PCT = 0.0005  # 0.05% per side (0.10% round trip)
 
 SCAN_INTERVAL  = 0.2     
 MONITOR_INT    = 0.05    
@@ -40,7 +38,7 @@ BATCH_SIZE     = 40
 MAX_WORKERS    = 20      
 SLOT_FILL_INT  = 0.01    
 
-MIN_SCORE      = 70      # SMART SCORE Minimum
+MIN_SCORE      = 65       # Lebih rendah agar lebih banyak sinyal
 MIN_GAP        = 5
 SLIPPAGE_GUARD = 0.0015  
 TTL_5M         = 2       
@@ -76,12 +74,10 @@ _executor       = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 _rescan_q       = queue.Queue()
 _hot_syms       = deque(maxlen=30)
 
-# Memory Management Quant v20
-_past_trades    = deque(maxlen=50) # Loss Detection Memory
-_cooldowns      = {} # 15 Menit Cooldown Symbol
+_past_trades    = deque(maxlen=50)
+_cooldowns      = {}
 _macro = {"fng": 50, "btc": "UNKNOWN", "last_fng": 0, "last_btc": 0}
 
-# Profit Protection States
 _prot = {
     "consec_loss": 0, 
     "consec_win": 0, 
@@ -96,7 +92,7 @@ _stats = {
 }
 
 # ═══════════════════════════════════════════════════════
-#  BINANCE UTILS
+#  BINANCE UTILS (tidak berubah)
 # ═══════════════════════════════════════════════════════
 _precision_cache = {}
 def get_precision(symbol):
@@ -173,8 +169,6 @@ def btc_trend():
         df = run_ta(ohlcv("BTCUSDT", Client.KLINE_INTERVAL_5MINUTE, 80).copy())
         row = df.iloc[-2]
         p, e5, e9, e21, m5 = row["close"], row["e5"], row["e9"], row["e21"], row["m5"]
-        
-        # Penyesuaian makro BTC yang lebih reaktif
         if p > e5 > e9 > e21 and m5 > 0.001: return "BULL"
         if p < e5 < e9 < e21 and m5 < -0.001: return "BEAR"
         return "SIDEWAYS"
@@ -182,10 +176,8 @@ def btc_trend():
 
 def ks_check():
     k, now = _ks, time.time()
-    
-    # Cek Profit Protection System (I) Pause 30 Menit
     if _prot["pause_until"] > now:
-        return True, "PROT_PAUSE(30m)"
+        return True, "PROT_PAUSE(20m)"  # pause 20 menit setelah 5 loss
 
     if k["active"] and now >= k["resume"]:
         k["active"] = False; k["consec"] = 0
@@ -203,28 +195,7 @@ def ks_upd(pnl):
     _ks["daily"] += pnl
 
 # ═══════════════════════════════════════════════════════
-#  F: LOSS DETECTION SYSTEM
-# ═══════════════════════════════════════════════════════
-def is_setup_blocked(sym, score, adx, vol_ratio):
-    if len(_past_trades) < 10: return False # Kumpulkan data terlebih dahulu
-    
-    # 1. Cek rasio kekalahan koin spesifik
-    sym_trades = [t for t in _past_trades if t['sym'] == sym]
-    if len(sym_trades) >= 4:
-        sym_loss_rate = len([t for t in sym_trades if t['pnl'] < 0]) / len(sym_trades)
-        if sym_loss_rate > 0.60: return True
-
-    # 2. Cek rasio kekalahan berdasar bracket ADX
-    adx_bin = round(adx / 5) * 5
-    adx_trades = [t for t in _past_trades if round(t['adx']/5)*5 == adx_bin]
-    if len(adx_trades) >= 5:
-        adx_loss_rate = len([t for t in adx_trades if t['pnl'] < 0]) / len(adx_trades)
-        if adx_loss_rate > 0.60: return True
-    
-    return False
-
-# ═══════════════════════════════════════════════════════
-#  A, B, C, G: SIGNAL & ENTRY ENGINE
+#  SIGNAL ENGINE dengan TP/SL untuk win rate tinggi
 # ═══════════════════════════════════════════════════════
 def signal(df, symbol=None):
     if df is None or len(df) < 55: return None, 0, [], 0.0, 0.0, 0.0
@@ -241,65 +212,60 @@ def signal(df, symbol=None):
 
     btc = _macro.get("btc", "UNKNOWN")
     
-    # Inisialisasi status filter
     l_valid, s_valid = True, True
 
-    # ================= A: STRICT ENTRY FILTER =================
-    # 1. Momentum & Noise Filter (Hindari Sideways)
-    if body < 0.15 or adx <= 22 or vr <= 1.3 or atr_pct < 0.0025:
+    # ================= FILTER (DILONGGARKAN) =================
+    if body < 0.10 or adx <= 18 or vr <= 1.1 or atr_pct < 0.0020:
         return None, 0, [], 0.0, 0.0, 0.0
 
-    # 2. LONG Syarat Mutlak
+    # LONG
     if not (p > e5 > e9 > e21 > e50): l_valid = False
-    if mh <= mh_p: l_valid = False # Histogram MACD harus naik
-    if not (52 <= rsi <= 72): l_valid = False
+    if mh <= mh_p: l_valid = False
+    if not (45 <= rsi <= 72): l_valid = False
 
-    # 3. SHORT Syarat Mutlak
+    # SHORT
     if not (p < e5 < e9 < e21 < e50): s_valid = False
-    if mh >= mh_p: s_valid = False # Histogram MACD harus turun
-    if not (28 <= rsi <= 48): s_valid = False
+    if mh >= mh_p: s_valid = False
+    if not (30 <= rsi <= 55): s_valid = False
 
-    # ================= B: BTC MARKET FILTER =================
+    # BTC FILTER
     if btc == "BEAR": l_valid = False
     if btc == "BULL": s_valid = False
     
     if not l_valid and not s_valid:
         return None, 0, [], 0.0, 0.0, 0.0
 
-    # ================= G: SMART SCORE SYSTEM =================
+    # ================= SMART SCORE =================
     score = 0
-    score += 30 # Trend Mutlak Valid
-    score += 20 # ADX > 22 Mutlak
-    score += 20 # Volume Spike Mutlak
-    score += 15 # MACD Mutlak
-    score += 10 # RSI Mutlak Valid
+    score += 30   # trend valid
+    score += 15   # ADX > 18
+    score += 15   # volume > 1.1
+    score += 15   # MACD arah benar
+    score += 10   # RSI ok
+    if btc == "BULL" and l_valid: score += 15
+    elif btc == "BEAR" and s_valid: score += 15
+    elif btc == "SIDEWAYS": score -= 5   # tidak terlalu menghukum
     
-    if btc == "BULL" and l_valid: score += 20
-    elif btc == "BEAR" and s_valid: score += 20
-    elif btc == "SIDEWAYS": score -= 20 # Potong score saat sideways
-
     if score < _prot["active_min_score"]:
         return None, 0, [], 0.0, 0.0, 0.0
 
-    # ================= F: LOSS DETECTION =================
-    if is_setup_blocked(symbol, score, adx, vr):
-        return None, 0, [], 0.0, 0.0, 0.0
-
-    # ================= C & J: DYNAMIC ATR TP/SL =================
-    # SL = max(0.25%, ATR * 1.0)
-    sl_pct = max(0.0025, atr_pct * 1.0)
-    # TP = max(0.80%, ATR * 2.5)
-    tp_pct = max(0.0080, atr_pct * 2.5)
-
-    # J: EXPECTANCY OPTIMIZATION (Ensure Net RR >= 2.5x)
-    net_sl = sl_pct + FUTURES_FEE_PCT
-    min_net_tp = net_sl * 2.5
-    required_gross_tp = min_net_tp + FUTURES_FEE_PCT
+    # ================= TP/SL untuk WIN RATE TINGGI =================
+    # Multiplier lebih kecil agar sinyal lebih sering TP
+    # SL = ATR * 0.7 (flexible 0.6~0.8)
+    sl_mult = 0.7
+    # TP = ATR * 1.0 (bisa 0.9~1.2)
+    tp_mult = 1.0
     
-    if tp_pct < required_gross_tp:
-        tp_pct = required_gross_tp # Paksa target TP untuk menjaga R:R rasio
+    sl_pct = max(0.0020, atr_pct * sl_mult)   # minimal 0.20%
+    tp_pct = max(0.0035, atr_pct * tp_mult)   # minimal 0.35% agar nutup fee
+    
+    # Pastikan TP_net (setelah fee) > 0.05% dan minimal lebih besar dari SL+2*fee
+    # agar satu kemenangan bisa menutup fee dan sedikit loss
+    min_tp_needed = sl_pct + (2 * FUTURES_FEE_PCT) + 0.0005  # ekstra 0.05%
+    if tp_pct < min_tp_needed:
+        tp_pct = min_tp_needed
 
-    # H: POSITION COOLDOWN
+    # COOLDOWN symbol setelah loss
     if symbol in _cooldowns and time.time() < _cooldowns[symbol]:
         return None, 0, [], 0.0, 0.0, 0.0
 
@@ -309,7 +275,7 @@ def signal(df, symbol=None):
         return "SHORT", score, ["Valid_S", f"ADX:{adx:.1f}"], atr, sl_pct, tp_pct
 
 # ═══════════════════════════════════════════════════════
-#  DRY RUN OPEN
+#  OPEN POSITION (tidak berubah)
 # ═══════════════════════════════════════════════════════
 def live_open(sym, direction, score, sigs, price, atr, sl_pct, tp_pct):
     with _lock:
@@ -341,11 +307,12 @@ def live_open(sym, direction, score, sigs, price, atr, sl_pct, tp_pct):
     with _lock: live_positions[sym] = pos
 
     d = "🟢" if direction == "LONG" else "🔴"
-    print(f"\n  {d} [DRY] {sym} {direction} @{price:.6g} SL:{sl_pct*100:.2f}% TP:{tp_pct*100:.2f}% RR: 1:{(tp_pct-FUTURES_FEE_PCT)/(sl_pct+FUTURES_FEE_PCT):.1f}")
+    rr_net = (tp_pct - FUTURES_FEE_PCT) / (sl_pct + FUTURES_FEE_PCT)
+    print(f"\n  {d} [DRY] {sym} {direction} @{price:.6g} SL:{sl_pct*100:.2f}% TP:{tp_pct*100:.2f}% Net RR:1:{rr_net:.1f}")
     _stats["trades"] += 1
 
 # ═══════════════════════════════════════════════════════
-#  DRY RUN CLOSE & I: PROFIT PROTECTION
+#  CLOSE POSITION & PROFIT PROTECTION (disesuaikan)
 # ═══════════════════════════════════════════════════════
 def live_close(sym, reason, price=None):
     with _lock: pos = live_positions.pop(sym, None)
@@ -369,34 +336,33 @@ def live_close(sym, reason, price=None):
     _stats["pnl"]  += pnl
     ks_upd(pnl)
 
-    # Catat data ke Memori Deteksi Loss (F)
     _past_trades.append({
         "sym": sym, "score": pos["score"], "adx": pos["adx"], "pnl": pnl
     })
 
-    # I: PROFIT PROTECTION SYSTEM
+    # Profit Protection (disesuaikan)
     if pnl >= 0:
         _stats["wins"] += 1
         _prot["consec_win"] += 1
         _prot["consec_loss"] = 0
         if _prot["consec_win"] >= 3 and _prot["active_min_score"] > MIN_SCORE:
             _prot["active_min_score"] = MIN_SCORE
-            print(f"  ✅ 3 Win Beruntun. Smart Score dikembalikan normal: {MIN_SCORE}")
+            print(f"  ✅ 3 Win beruntun → Score turun ke {MIN_SCORE}")
     else:
         _stats["losses"] += 1
         _prot["consec_loss"] += 1
         _prot["consec_win"] = 0
         
-        # H: COOLDOWN 15 Menit untuk Pair yang SL
+        # Cooldown 15 menit untuk pair yang kena SL
         if "SL" in reason: _cooldowns[sym] = time.time() + 900
         
         if _prot["consec_loss"] >= 5:
-            _prot["pause_until"] = time.time() + 1800 # 30 Menit
+            _prot["pause_until"] = time.time() + 1200   # 20 menit (lebih cepat pulih)
             _prot["consec_loss"] = 0
-            print("  🚨 5 Loss Beruntun! Bot Pause 30 Menit.")
+            print("  🚨 5 Loss beruntun! Bot pause 20 menit.")
         elif _prot["consec_loss"] >= 3:
-            _prot["active_min_score"] = 80
-            print("  ⚠️ 3 Loss Beruntun. Smart Score min dinaikkan ke: 80")
+            _prot["active_min_score"] = 75   # naikkan threshold tapi tidak terlalu tinggi
+            print("  ⚠️ 3 Loss beruntun → Min Score naik ke 75")
 
     trade_log.append({
         "sym": sym, "side": side, "entry": round(entry, 7), "exit": round(price, 7),
@@ -406,7 +372,7 @@ def live_close(sym, reason, price=None):
     _rescan_q.put(1)
 
 # ═══════════════════════════════════════════════════════
-#  D & E: MONITOR POSITIONS (TRAIL & BE)
+#  MONITOR POSITIONS (BE & TRAIL disesuaikan untuk TP kecil)
 # ═══════════════════════════════════════════════════════
 def monitor_positions():
     for sym in list(live_positions.keys()):
@@ -422,49 +388,46 @@ def monitor_positions():
         prof_pct = (px - entry) / entry if side == "LONG" else (entry - px) / entry
         pos["max_prof"] = max(pos["max_prof"], prof_pct)
 
-        # ----------------------------------------------------
-        # D & E: DYNAMIC MANAGEMENT LOGIC
-        # ----------------------------------------------------
         stage = pos["stage"]
         
-        # D: Break Even (+0.40%)
-        if pos["max_prof"] >= 0.0040 and stage < 1:
+        # Break Even di +0.30% (lebih rendah)
+        if pos["max_prof"] >= 0.0030 and stage < 1:
             pos["stage"] = 1
-            # Geser SL ke Entry + Fee (0.10%) + Extra Buffer (0.05%)
+            # SL pindah ke entry + fee + 0.05% buffer
             if side == "LONG": pos["sl_price"] = entry * (1 + FUTURES_FEE_PCT + 0.0005)
             else: pos["sl_price"] = entry * (1 - (FUTURES_FEE_PCT + 0.0005))
-            print(f"  🛡️ {sym} Break-Even Active!")
+            print(f"  🛡️ {sym} Break-Even active!")
 
-        # E: Trailing Profit Stage 1 (+0.70%) -> Trail 0.25%
-        if pos["max_prof"] >= 0.0070 and stage < 2: pos["stage"] = 2
+        # Trail Stage 1 di +0.50% (trail 0.20%)
+        if pos["max_prof"] >= 0.0050 and stage < 2: pos["stage"] = 2
             
-        # E: Trailing Profit Stage 2 (+1.20%) -> Trail 0.35%
-        if pos["max_prof"] >= 0.0120 and stage < 3: pos["stage"] = 3
+        # Trail Stage 2 di +0.80% (trail 0.25%)
+        if pos["max_prof"] >= 0.0080 and stage < 3: pos["stage"] = 3
 
-        # Apply Trailing Berjalan
+        # Apply trailing
         if pos["stage"] == 2:
+            if side == "LONG": pos["sl_price"] = max(pos["sl_price"], px * (1 - 0.0020))
+            else: pos["sl_price"] = min(pos["sl_price"], px * (1 + 0.0020))
+        elif pos["stage"] == 3:
             if side == "LONG": pos["sl_price"] = max(pos["sl_price"], px * (1 - 0.0025))
             else: pos["sl_price"] = min(pos["sl_price"], px * (1 + 0.0025))
-        elif pos["stage"] == 3:
-            if side == "LONG": pos["sl_price"] = max(pos["sl_price"], px * (1 - 0.0035))
-            else: pos["sl_price"] = min(pos["sl_price"], px * (1 + 0.0035))
 
-        sl_px = pos["sl_price"] # Update var
+        sl_px = pos["sl_price"]
         
-        # Eksekusi Exit
+        # Eksekusi exit
         if side == "LONG":
             if px <= sl_px:
                 live_close(sym, "TrailSL" if stage > 0 else "HardSL", px); continue
             if px >= tp_px:
-                live_close(sym, "ExtremeTP", px); continue
+                live_close(sym, "TakeProfit", px); continue
         else:
             if px >= sl_px:
                 live_close(sym, "TrailSL" if stage > 0 else "HardSL", px); continue
             if px <= tp_px:
-                live_close(sym, "ExtremeTP", px); continue
+                live_close(sym, "TakeProfit", px); continue
 
 # ═══════════════════════════════════════════════════════
-#  SCANNER & THREADS
+#  SCANNER & THREADS (sama seperti sebelumnya)
 # ═══════════════════════════════════════════════════════
 def scan_one(sym):
     try:
@@ -500,7 +463,7 @@ def print_full():
     pnl  = _stats["pnl"]
     e    = "💚" if pnl >= 0 else "🔴"
     print(f"\n  {'─'*68}")
-    print(f"    ✅ HFT QUANT v20.0.0 [DYANMIC ATR TP/SL | FILTER STRICT]")
+    print(f"    ✅ HFT QUANT v20.1.0 [HIGH WIN RATE | FEE COVERAGE]")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
     print(f"    {e} PnL Net:{pnl:+.5f}U")
     if trade_log:
@@ -576,10 +539,10 @@ def t_macro():
 # ═══════════════════════════════════════════════════════
 def run_bot():
     print("╔═══════════════════════════════════════════════════════════════╗")
-    print("║  ✅ HFT QUANT ENGINE v20.0.0 — EXPECTANCY OPTIMIZED           ║")
-    print("║  🔒 Strict Entry Filter & Dynamic ATR Risk Management         ║")
-    print("║  🛡️ Break-Even & 2-Stage Trailing Profit Enabled              ║")
-    print("║  🧠 AI Loss Detection System & Drawdown Protection            ║")
+    print("║  ✅ HFT QUANT v20.1.0 — HIGH WIN RATE & FEE COVERAGE          ║")
+    print("║  🎯 Target win rate > 50% dengan TP/SL pendek                 ║")
+    print("║  💰 Setiap profit bersih setelah fee > 0.05%                  ║")
+    print("║  🛡️ Break-Even & Trailing Profit di level rendah              ║")
     print("╚═══════════════════════════════════════════════════════════════╝")
 
     syms = list(dict.fromkeys(SYMBOLS))
