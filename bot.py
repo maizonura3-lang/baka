@@ -1,10 +1,13 @@
 """
-Bot Scalping v19.4.0 — DRY RUN LOG MODE (PAPER TRADING)
+Bot Scalping Quant v20.0.0 — HFT & EXPECTANCY OPTIMIZED
 ====================================================
-MODIFIKASI v19.4.0:
-- Arah posisi entry dikembalikan ke normal (Sinyal LONG buka LONG, Sinyal SHORT buka SHORT)
-- Target TP tetap dikunci pada 0.50% dan Target SL dikunci pada 0.20%
-- Slot spam tetap 3 posisi, size per order tetap 2 USD
+MODIFIKASI:
+- Strict Entry Filtering (EMA, ADX>22, Vol>1.3, MACD Hist, RSI)
+- BTC Macro Directional Lock
+- ATR Dynamic TP/SL (RR Net > 1:2.5)
+- Auto Break Even & 2-Stage Trailing Profit
+- Smart Score & Loss Detection System (Auto-Block)
+- Drawdown Protection & Cooldown Management
 """
 
 import os, time, math, threading, queue
@@ -19,20 +22,16 @@ import numpy as np
 
 load_dotenv()
 client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
-client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
+client.FUTURES_URL = "https://fapi.binance.com/fapi" # Ganti ke mainnet jika sudah siap
 
 # ═══════════════════════════════════════════════════════
-#  CONFIG v19.4.0
+#  CONFIG v20.0.0
 # ═══════════════════════════════════════════════════════
 
 LEVERAGE       = 20
 ORDER_USDT     = 2.0
 MAX_POSITIONS  = 3 
-
-# ── TP/SL STRATEGY v19.4.0 (ASIMETRIS FIXED) ────────────────
-FIXED_TP_PCT    = 0.0050  # 0.5%
-FIXED_SL_PCT    = 0.0020  # 0.2%
-FUTURES_FEE_PCT = 0.0005  # Taker fee 0.05% (Total masuk + keluar = 0.1%)
+FUTURES_FEE_PCT = 0.0005  # Taker fee 0.05% (Round trip = 0.10%)
 
 SCAN_INTERVAL  = 0.2     
 MONITOR_INT    = 0.05    
@@ -41,14 +40,13 @@ BATCH_SIZE     = 40
 MAX_WORKERS    = 20      
 SLOT_FILL_INT  = 0.01    
 
-MIN_SCORE      = 50      
+MIN_SCORE      = 70      # SMART SCORE Minimum
 MIN_GAP        = 5
 SLIPPAGE_GUARD = 0.0015  
 TTL_5M         = 2       
 
 DAILY_LOSS     = -20.0
 CONSEC_MAX     = 15
-CONSEC_PAUSE   = 10
 
 # ═══════════════════════════════════════════════════════
 #  SYMBOLS
@@ -66,7 +64,7 @@ SYMBOLS = [
 SYMBOLS = list(dict.fromkeys(SYMBOLS))
 
 # ═══════════════════════════════════════════════════════
-#  STATE
+#  STATE & MEMORY
 # ═══════════════════════════════════════════════════════
 live_positions  = {}
 trade_log       = []
@@ -78,7 +76,18 @@ _executor       = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 _rescan_q       = queue.Queue()
 _hot_syms       = deque(maxlen=30)
 
+# Memory Management Quant v20
+_past_trades    = deque(maxlen=50) # Loss Detection Memory
+_cooldowns      = {} # 15 Menit Cooldown Symbol
 _macro = {"fng": 50, "btc": "UNKNOWN", "last_fng": 0, "last_btc": 0}
+
+# Profit Protection States
+_prot = {
+    "consec_loss": 0, 
+    "consec_win": 0, 
+    "active_min_score": MIN_SCORE, 
+    "pause_until": 0
+}
 _ks    = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
 _stats = {
     "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0,
@@ -104,8 +113,7 @@ def get_precision(symbol):
 
 def qty(symbol, price):
     raw_qty = (ORDER_USDT * LEVERAGE) / price
-    prec = get_precision(symbol)
-    return round(raw_qty, prec)
+    return round(raw_qty, get_precision(symbol))
 
 def price_live(symbol):
     try: return float(client.futures_symbol_ticker(symbol=symbol)["price"])
@@ -130,8 +138,7 @@ def tickers_all():
 
 def ohlcv(symbol, interval, limit=100):
     key, now = (symbol, interval), time.time()
-    ttl = TTL_5M
-    if key in _ohlcv_cache and now - _ohlcv_cache[key][0] < ttl:
+    if key in _ohlcv_cache and now - _ohlcv_cache[key][0] < TTL_5M:
         return _ohlcv_cache[key][1]
     try:
         kl = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
@@ -141,8 +148,7 @@ def ohlcv(symbol, interval, limit=100):
             df[c] = df[c].astype(float)
         _ohlcv_cache[key] = (now, df)
         return df
-    except:
-        return _ohlcv_cache.get(key, (None, None))[1]
+    except: return _ohlcv_cache.get(key, (None, None))[1]
 
 def run_ta(df):
     c, h, l, v = df["close"], df["high"], df["low"], df["volume"]
@@ -156,12 +162,10 @@ def run_ta(df):
     df["adx"]  = ta.trend.ADXIndicator(h, l, c, 14).adx()
     df["vm"]   = v.rolling(20).mean()
     df["vr"]   = v / df["vm"].replace(0, 1)
-    df["br"]   = df["tbbase"] / df["volume"].replace(0, 1)
     df["body"] = abs(c - df["open"])
     df["rng"]  = h - l
     df["br2"]  = df["body"] / df["rng"].replace(0, 1)
     df["m5"]   = (c - c.shift(5)) / c.shift(5)
-    df["m3"]   = (c - c.shift(3)) / c.shift(3)
     return df
 
 def btc_trend():
@@ -169,15 +173,20 @@ def btc_trend():
         df = run_ta(ohlcv("BTCUSDT", Client.KLINE_INTERVAL_5MINUTE, 80).copy())
         row = df.iloc[-2]
         p, e5, e9, e21, m5 = row["close"], row["e5"], row["e9"], row["e21"], row["m5"]
+        
+        # Penyesuaian makro BTC yang lebih reaktif
         if p > e5 > e9 > e21 and m5 > 0.001: return "BULL"
         if p < e5 < e9 < e21 and m5 < -0.001: return "BEAR"
-        if p > e9 > e21: return "MILD_BULL"
-        if p < e9 < e21: return "MILD_BEAR"
         return "SIDEWAYS"
     except: return "UNKNOWN"
 
 def ks_check():
     k, now = _ks, time.time()
+    
+    # Cek Profit Protection System (I) Pause 30 Menit
+    if _prot["pause_until"] > now:
+        return True, "PROT_PAUSE(30m)"
+
     if k["active"] and now >= k["resume"]:
         k["active"] = False; k["consec"] = 0
     if k["active"]: return True, k["reason"]
@@ -188,74 +197,123 @@ def ks_check():
         k["reason"] = f"daily({k['daily']:.2f})"
         k["resume"] = day + 86400
         return True, k["reason"]
-    if k["consec"] >= CONSEC_MAX:
-        k["active"] = True
-        k["reason"] = f"consec({k['consec']})"
-        k["resume"] = now + CONSEC_PAUSE
-        return True, k["reason"]
     return False, ""
 
 def ks_upd(pnl):
     _ks["daily"] += pnl
-    _ks["consec"] = 0 if pnl >= 0 else _ks["consec"] + 1
 
 # ═══════════════════════════════════════════════════════
-#  SIGNAL v19.4.0 (NORMAL ENGINE)
+#  F: LOSS DETECTION SYSTEM
+# ═══════════════════════════════════════════════════════
+def is_setup_blocked(sym, score, adx, vol_ratio):
+    if len(_past_trades) < 10: return False # Kumpulkan data terlebih dahulu
+    
+    # 1. Cek rasio kekalahan koin spesifik
+    sym_trades = [t for t in _past_trades if t['sym'] == sym]
+    if len(sym_trades) >= 4:
+        sym_loss_rate = len([t for t in sym_trades if t['pnl'] < 0]) / len(sym_trades)
+        if sym_loss_rate > 0.60: return True
+
+    # 2. Cek rasio kekalahan berdasar bracket ADX
+    adx_bin = round(adx / 5) * 5
+    adx_trades = [t for t in _past_trades if round(t['adx']/5)*5 == adx_bin]
+    if len(adx_trades) >= 5:
+        adx_loss_rate = len([t for t in adx_trades if t['pnl'] < 0]) / len(adx_trades)
+        if adx_loss_rate > 0.60: return True
+    
+    return False
+
+# ═══════════════════════════════════════════════════════
+#  A, B, C, G: SIGNAL & ENTRY ENGINE
 # ═══════════════════════════════════════════════════════
 def signal(df, symbol=None):
     if df is None or len(df) < 55: return None, 0, [], 0.0, 0.0, 0.0
 
     row  = df.iloc[-2]
     prev = df.iloc[-3]
-    prev2= df.iloc[-4]
 
     p, e5, e9, e21, e50 = row["close"], row["e5"], row["e9"], row["e21"], row["e50"]
-    rsi  = row["rsi"]
-    mh   = row["mh"];  mh_p = prev["mh"];  mh_p2 = prev2["mh"]
-    vr   = row["vr"];  br   = row["br"]
-    m5   = row["m5"]
-    body = row["br2"]
-    atr  = row["atr"]
+    rsi  = row["rsi"]; adx = row["adx"]; vr = row["vr"]
+    mh   = row["mh"]; mh_p = prev["mh"]
+    atr  = row["atr"]; body = row["br2"]
+    
+    atr_pct = atr / p if p > 0 else 0
 
-    if body < 0.15: return None, 0, [], atr, 0.0, 0.0
+    btc = _macro.get("btc", "UNKNOWN")
+    
+    # Inisialisasi status filter
+    l_valid, s_valid = True, True
 
-    lp = sp = 0
-    sl, ss = [], []
+    # ================= A: STRICT ENTRY FILTER =================
+    # 1. Momentum & Noise Filter (Hindari Sideways)
+    if body < 0.15 or adx <= 22 or vr <= 1.3 or atr_pct < 0.0025:
+        return None, 0, [], 0.0, 0.0, 0.0
 
-    if p > e5 > e9 > e21 > e50:   lp += 32; sl.append("EMA5↑")
-    elif p > e5 > e9 > e21:       lp += 24; sl.append("EMA4↑")
-    if p < e5 < e9 < e21 < e50:   sp += 32; ss.append("EMA5↓")
-    elif p < e5 < e9 < e21:       sp += 24; ss.append("EMA4↓")
+    # 2. LONG Syarat Mutlak
+    if not (p > e5 > e9 > e21 > e50): l_valid = False
+    if mh <= mh_p: l_valid = False # Histogram MACD harus naik
+    if not (52 <= rsi <= 72): l_valid = False
 
-    if m5 > 0.002:   lp += 28; sl.append(f"Mom+{m5*100:.1f}%")
-    if m5 < -0.002:  sp += 28; ss.append(f"Mom{m5*100:.1f}%")
+    # 3. SHORT Syarat Mutlak
+    if not (p < e5 < e9 < e21 < e50): s_valid = False
+    if mh >= mh_p: s_valid = False # Histogram MACD harus turun
+    if not (28 <= rsi <= 48): s_valid = False
 
-    if mh_p <= 0 and mh > 0:           lp += 24; sl.append("MACD_X↑")
-    elif mh > 0 and mh > mh_p > mh_p2: lp += 18; sl.append("MACD↑↑")
-    if mh_p >= 0 and mh < 0:           sp += 24; ss.append("MACD_X↓")
-    elif mh < 0 and mh < mh_p < mh_p2: sp += 18; ss.append("MACD↓↓")
+    # ================= B: BTC MARKET FILTER =================
+    if btc == "BEAR": l_valid = False
+    if btc == "BULL": s_valid = False
+    
+    if not l_valid and not s_valid:
+        return None, 0, [], 0.0, 0.0, 0.0
 
-    if br > 0.52:   lp += 22; sl.append(f"Buy{br:.0%}")
-    if br < 0.48:   sp += 22; ss.append(f"Sell{1-br:.0%}")
+    # ================= G: SMART SCORE SYSTEM =================
+    score = 0
+    score += 30 # Trend Mutlak Valid
+    score += 20 # ADX > 22 Mutlak
+    score += 20 # Volume Spike Mutlak
+    score += 15 # MACD Mutlak
+    score += 10 # RSI Mutlak Valid
+    
+    if btc == "BULL" and l_valid: score += 20
+    elif btc == "BEAR" and s_valid: score += 20
+    elif btc == "SIDEWAYS": score -= 20 # Potong score saat sideways
 
-    thresh = MIN_SCORE
-    gap    = abs(lp - sp)
+    if score < _prot["active_min_score"]:
+        return None, 0, [], 0.0, 0.0, 0.0
 
-    # ARAH DIREKTIF NORMAL: Analisa LONG -> Open LONG. Analisa SHORT -> Open SHORT.
-    if lp > sp:
-        if lp < thresh or gap < MIN_GAP: return None, lp, [], atr, 0.0, 0.0
-        return "LONG", lp, sl[:4], atr, FIXED_SL_PCT, FIXED_TP_PCT
+    # ================= F: LOSS DETECTION =================
+    if is_setup_blocked(symbol, score, adx, vr):
+        return None, 0, [], 0.0, 0.0, 0.0
+
+    # ================= C & J: DYNAMIC ATR TP/SL =================
+    # SL = max(0.25%, ATR * 1.0)
+    sl_pct = max(0.0025, atr_pct * 1.0)
+    # TP = max(0.80%, ATR * 2.5)
+    tp_pct = max(0.0080, atr_pct * 2.5)
+
+    # J: EXPECTANCY OPTIMIZATION (Ensure Net RR >= 2.5x)
+    net_sl = sl_pct + FUTURES_FEE_PCT
+    min_net_tp = net_sl * 2.5
+    required_gross_tp = min_net_tp + FUTURES_FEE_PCT
+    
+    if tp_pct < required_gross_tp:
+        tp_pct = required_gross_tp # Paksa target TP untuk menjaga R:R rasio
+
+    # H: POSITION COOLDOWN
+    if symbol in _cooldowns and time.time() < _cooldowns[symbol]:
+        return None, 0, [], 0.0, 0.0, 0.0
+
+    if l_valid:
+        return "LONG", score, ["Valid_L", f"ADX:{adx:.1f}"], atr, sl_pct, tp_pct
     else:
-        if sp < thresh or gap < MIN_GAP: return None, max(lp, sp), [], atr, 0.0, 0.0
-        return "SHORT", sp, ss[:4], atr, FIXED_SL_PCT, FIXED_TP_PCT
+        return "SHORT", score, ["Valid_S", f"ADX:{adx:.1f}"], atr, sl_pct, tp_pct
 
 # ═══════════════════════════════════════════════════════
 #  DRY RUN OPEN
 # ═══════════════════════════════════════════════════════
 def live_open(sym, direction, score, sigs, price, atr, sl_pct, tp_pct):
     with _lock:
-        if sym in live_positions or len(live_positions) >= MAX_POSITIONS:
-            return
+        if sym in live_positions or len(live_positions) >= MAX_POSITIONS: return
         live_positions[sym] = {"_r": True}
 
     px_now = price_live(sym)
@@ -266,48 +324,39 @@ def live_open(sym, direction, score, sigs, price, atr, sl_pct, tp_pct):
             return
         price = px_now
 
-    try:
-        q_val = qty(sym, price)
+    try: q_val = qty(sym, price)
     except:
         with _lock: live_positions.pop(sym, None)
         return
 
-    if direction == "LONG":
-        sl_price = price * (1 - sl_pct)
-        tp_price = price * (1 + tp_pct)
-    else:
-        sl_price = price * (1 + sl_pct)
-        tp_price = price * (1 - tp_pct)
+    sl_price = price * (1 - sl_pct) if direction == "LONG" else price * (1 + sl_pct)
+    tp_price = price * (1 + tp_pct) if direction == "LONG" else price * (1 - tp_pct)
 
     pos = {
         "side": direction, "entry": price, "qty": q_val,
         "open_time": time.time(), "score": score, "sigs": sigs, "atr": atr,
         "sl_price": sl_price, "tp_price": tp_price,
-        "sl_pct": sl_pct, "tp_pct": tp_pct
+        "sl_pct": sl_pct, "tp_pct": tp_pct, "max_prof": 0.0, "stage": 0, "adx": float(sigs[1].split(":")[1])
     }
     with _lock: live_positions[sym] = pos
 
     d = "🟢" if direction == "LONG" else "🔴"
-    print(f"\n  {d} [DRY] {sym} {direction} @{price:.6g} SL:{sl_pct*100:.2f}% TP:{tp_pct*100:.2f}% [{' | '.join(sigs)}]")
+    print(f"\n  {d} [DRY] {sym} {direction} @{price:.6g} SL:{sl_pct*100:.2f}% TP:{tp_pct*100:.2f}% RR: 1:{(tp_pct-FUTURES_FEE_PCT)/(sl_pct+FUTURES_FEE_PCT):.1f}")
     _stats["trades"] += 1
 
 # ═══════════════════════════════════════════════════════
-#  DRY RUN CLOSE
+#  DRY RUN CLOSE & I: PROFIT PROTECTION
 # ═══════════════════════════════════════════════════════
 def live_close(sym, reason, price=None):
-    with _lock:
-        pos = live_positions.pop(sym, None)
+    with _lock: pos = live_positions.pop(sym, None)
     if pos is None or pos.get("_r"): return
 
     if price is None: price = price_live(sym)
     if price == 0: return
 
     side, entry, q_val = pos["side"], pos["entry"], pos["qty"]
-
     gross_pnl = (price - entry) * q_val if side == "LONG" else (entry - price) * q_val
-    open_fee  = (entry * q_val) * FUTURES_FEE_PCT
-    close_fee = (price * q_val) * FUTURES_FEE_PCT
-    total_fee = open_fee + close_fee
+    total_fee = ((entry * q_val) + (price * q_val)) * FUTURES_FEE_PCT
     pnl = gross_pnl - total_fee
 
     pct   = (price - entry) / entry * 100 if side == "LONG" else (entry - price) / entry * 100
@@ -318,18 +367,36 @@ def live_close(sym, reason, price=None):
     print(f"     {entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL Net:{pnl:+.5f}U (Fee:{total_fee:.5f}U)")
 
     _stats["pnl"]  += pnl
-    _stats["hist"].append(pnl)
     ks_upd(pnl)
 
+    # Catat data ke Memori Deteksi Loss (F)
+    _past_trades.append({
+        "sym": sym, "score": pos["score"], "adx": pos["adx"], "pnl": pnl
+    })
+
+    # I: PROFIT PROTECTION SYSTEM
     if pnl >= 0:
         _stats["wins"] += 1
-        if pnl > _stats["best"]: _stats["best"] = pnl
+        _prot["consec_win"] += 1
+        _prot["consec_loss"] = 0
+        if _prot["consec_win"] >= 3 and _prot["active_min_score"] > MIN_SCORE:
+            _prot["active_min_score"] = MIN_SCORE
+            print(f"  ✅ 3 Win Beruntun. Smart Score dikembalikan normal: {MIN_SCORE}")
     else:
         _stats["losses"] += 1
-        if pnl < _stats["worst"]: _stats["worst"] = pnl
-
-    if "ExtremeTP" in reason:   _stats["extreme_tp"] += 1
-    elif "HardSL"  in reason:   _stats["hard_sl"]    += 1
+        _prot["consec_loss"] += 1
+        _prot["consec_win"] = 0
+        
+        # H: COOLDOWN 15 Menit untuk Pair yang SL
+        if "SL" in reason: _cooldowns[sym] = time.time() + 900
+        
+        if _prot["consec_loss"] >= 5:
+            _prot["pause_until"] = time.time() + 1800 # 30 Menit
+            _prot["consec_loss"] = 0
+            print("  🚨 5 Loss Beruntun! Bot Pause 30 Menit.")
+        elif _prot["consec_loss"] >= 3:
+            _prot["active_min_score"] = 80
+            print("  ⚠️ 3 Loss Beruntun. Smart Score min dinaikkan ke: 80")
 
     trade_log.append({
         "sym": sym, "side": side, "entry": round(entry, 7), "exit": round(price, 7),
@@ -337,10 +404,9 @@ def live_close(sym, reason, price=None):
     })
     _hot_syms.appendleft(sym)
     _rescan_q.put(1)
-    print_inline()
 
 # ═══════════════════════════════════════════════════════
-#  MONITOR POSITIONS
+#  D & E: MONITOR POSITIONS (TRAIL & BE)
 # ═══════════════════════════════════════════════════════
 def monitor_positions():
     for sym in list(live_positions.keys()):
@@ -350,51 +416,67 @@ def monitor_positions():
         px = price_live(sym)
         if px == 0: continue
 
-        side  = pos["side"]
-        entry = pos["entry"]
-        sl_px = pos["sl_price"]
-        tp_px = pos["tp_price"]
-        hold  = time.time() - pos["open_time"]
+        side, entry = pos["side"], pos["entry"]
+        sl_px, tp_px = pos["sl_price"], pos["tp_price"]
+        
+        prof_pct = (px - entry) / entry if side == "LONG" else (entry - px) / entry
+        pos["max_prof"] = max(pos["max_prof"], prof_pct)
 
+        # ----------------------------------------------------
+        # D & E: DYNAMIC MANAGEMENT LOGIC
+        # ----------------------------------------------------
+        stage = pos["stage"]
+        
+        # D: Break Even (+0.40%)
+        if pos["max_prof"] >= 0.0040 and stage < 1:
+            pos["stage"] = 1
+            # Geser SL ke Entry + Fee (0.10%) + Extra Buffer (0.05%)
+            if side == "LONG": pos["sl_price"] = entry * (1 + FUTURES_FEE_PCT + 0.0005)
+            else: pos["sl_price"] = entry * (1 - (FUTURES_FEE_PCT + 0.0005))
+            print(f"  🛡️ {sym} Break-Even Active!")
+
+        # E: Trailing Profit Stage 1 (+0.70%) -> Trail 0.25%
+        if pos["max_prof"] >= 0.0070 and stage < 2: pos["stage"] = 2
+            
+        # E: Trailing Profit Stage 2 (+1.20%) -> Trail 0.35%
+        if pos["max_prof"] >= 0.0120 and stage < 3: pos["stage"] = 3
+
+        # Apply Trailing Berjalan
+        if pos["stage"] == 2:
+            if side == "LONG": pos["sl_price"] = max(pos["sl_price"], px * (1 - 0.0025))
+            else: pos["sl_price"] = min(pos["sl_price"], px * (1 + 0.0025))
+        elif pos["stage"] == 3:
+            if side == "LONG": pos["sl_price"] = max(pos["sl_price"], px * (1 - 0.0035))
+            else: pos["sl_price"] = min(pos["sl_price"], px * (1 + 0.0035))
+
+        sl_px = pos["sl_price"] # Update var
+        
+        # Eksekusi Exit
         if side == "LONG":
-            prof_pct = (px - entry) / entry
             if px <= sl_px:
-                live_close(sym, "HardSL", px); continue
+                live_close(sym, "TrailSL" if stage > 0 else "HardSL", px); continue
             if px >= tp_px:
                 live_close(sym, "ExtremeTP", px); continue
-
-            pnl_now = ((px - entry) * pos["qty"]) - ((entry * pos["qty"] + px * pos["qty"]) * FUTURES_FEE_PCT)
-            print(f"    📌 {sym} L@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s [DRY]")
-
-        else:  # SHORT
-            prof_pct = (entry - px) / entry
+        else:
             if px >= sl_px:
-                live_close(sym, "HardSL", px); continue
+                live_close(sym, "TrailSL" if stage > 0 else "HardSL", px); continue
             if px <= tp_px:
                 live_close(sym, "ExtremeTP", px); continue
 
-            pnl_now = ((entry - px) * pos["qty"]) - ((entry * pos["qty"] + px * pos["qty"]) * FUTURES_FEE_PCT)
-            print(f"    📌 {sym} S@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s [DRY]")
-
 # ═══════════════════════════════════════════════════════
-#  SCANNER
+#  SCANNER & THREADS
 # ═══════════════════════════════════════════════════════
 def scan_one(sym):
     try:
         time.sleep(SCAN_DELAY)
         df5 = run_ta(ohlcv(sym, Client.KLINE_INTERVAL_5MINUTE, 100).copy())
         if df5 is None: return None
-
         px  = df5["close"].iloc[-2]
-        atr = df5["atr"].iloc[-2]
         if px == 0: return None
-
         dir_, sc, sigs, atr_val, sl_pct, tp_pct = signal(df5, sym)
         if dir_ is None: return None
-
         px_live = price_live(sym)
         if px_live == 0: return None
-
         return (sym, dir_, sc, sigs, px_live, atr_val, sl_pct, tp_pct)
     except: return None
 
@@ -403,9 +485,7 @@ def scan_batch(syms):
     fut = {_executor.submit(scan_one, s): s for s in syms[:BATCH_SIZE]}
     try:
         for f in as_completed(fut, timeout=5):
-            try:
-                if r := f.result(timeout=1): res.append(r)
-            except: pass
+            if r := f.result(timeout=1): res.append(r)
     except: pass
     return res
 
@@ -414,30 +494,15 @@ def top_movers(syms, n=30):
     mv = [(s, abs(d["pct"])) for s, d in tk.items() if s in ss]
     return [s for s, _ in sorted(mv, key=lambda x: x[1], reverse=True)[:n]]
 
-# ═══════════════════════════════════════════════════════
-#  PRINT UTILS
-# ═══════════════════════════════════════════════════════
-def print_inline():
-    n  = _stats["wins"] + _stats["losses"]
-    wr = _stats["wins"] / n * 100 if n else 0
-    pnl, e = _stats["pnl"], "💚" if _stats["pnl"] >= 0 else "🔴"
-    print(f"       ┌ [v19.4.0 DRY] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL Net:{pnl:+.4f}U")
-    print(f"       └ ExTP:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']}")
-
 def print_full():
     n    = _stats["wins"] + _stats["losses"]
     wr   = _stats["wins"] / n * 100 if n else 0
     pnl  = _stats["pnl"]
-    sess = (time.time() - _stats["start"]) / 3600
-    tph  = n / sess if sess > 0 else 0
     e    = "💚" if pnl >= 0 else "🔴"
-
     print(f"\n  {'─'*68}")
-    print(f"    ✅ DRY RUN v19.4.0 [TP 0.50% | SL 0.20% | NORMAL ENTRY MODE]")
+    print(f"    ✅ HFT QUANT v20.0.0 [DYANMIC ATR TP/SL | FILTER STRICT]")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
-    print(f"    {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
-    print(f"    💰 ExtremeTP:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']}")
-    print(f"    ⚙️  Config: Target TP={FIXED_TP_PCT*100:.2f}% SL={FIXED_SL_PCT*100:.2f}% MaxPos={MAX_POSITIONS} PerOrder={ORDER_USDT}U")
+    print(f"    {e} PnL Net:{pnl:+.5f}U")
     if trade_log:
         print(f"    📋 Last 5:")
         for t in trade_log[-5:]:
@@ -445,40 +510,31 @@ def print_full():
             print(f"       {em} {t['sym']:<16} {t['side']} {t['pnl']:+.5f}U {t['hold']}s — {t['reason']}")
     print(f"  {'─'*68}")
 
-# ═══════════════════════════════════════════════════════
-#  THREADS
-# ═══════════════════════════════════════════════════════
 def t_monitor():
     while True:
         try:
-            if live_positions:
-                monitor_positions()
+            if live_positions: monitor_positions()
         except: pass
         time.sleep(MONITOR_INT)
 
 def t_slot_filler(syms):
     scan_idx = 0
     n_bat    = math.ceil(len(syms) / BATCH_SIZE)
-
     while True:
         try:
             slots = MAX_POSITIONS - len(live_positions)
             if slots <= 0 or ks_check()[0]:
-                time.sleep(SLOT_FILL_INT)
-                continue
-
+                time.sleep(SLOT_FILL_INT); continue
+            
             hot  = [s for s in _hot_syms if s not in live_positions]
-            mv   = top_movers(syms, 30)
-            mv   = [s for s in mv   if s not in live_positions]
-
+            mv   = [s for s in top_movers(syms, 30) if s not in live_positions]
             bs   = scan_idx * BATCH_SIZE
             reg  = [s for s in syms[bs:bs+BATCH_SIZE] if s not in live_positions and s not in mv]
             scan_idx = (scan_idx + 1) % n_bat
 
             scan_list = list(dict.fromkeys(hot[:5] + mv[:20] + reg[:15]))[:BATCH_SIZE]
             if not scan_list:
-                time.sleep(SLOT_FILL_INT)
-                continue
+                time.sleep(SLOT_FILL_INT); continue
 
             res = scan_batch(scan_list)
             if res:
@@ -487,7 +543,6 @@ def t_slot_filler(syms):
                     if len(live_positions) >= MAX_POSITIONS: break
                     sym, d, sc, sg, px, atr, sl_p, tp_p = r
                     live_open(sym, d, sc, sg, px, atr, sl_p, tp_p)
-
         except: pass
         time.sleep(SLOT_FILL_INT)
 
@@ -521,44 +576,35 @@ def t_macro():
 # ═══════════════════════════════════════════════════════
 def run_bot():
     print("╔═══════════════════════════════════════════════════════════════╗")
-    print("║  ✅ DRY RUN v19.4.0 — NORMAL DIRECTION ENTRY ENGINE           ║")
-    print("║  ✅ Target Take Profit diatur ketat: 0.50%                     ║")
-    print("║  ✅ Target Stop Loss diatur ketat: 0.20%                       ║")
+    print("║  ✅ HFT QUANT ENGINE v20.0.0 — EXPECTANCY OPTIMIZED           ║")
+    print("║  🔒 Strict Entry Filter & Dynamic ATR Risk Management         ║")
+    print("║  🛡️ Break-Even & 2-Stage Trailing Profit Enabled              ║")
+    print("║  🧠 AI Loss Detection System & Drawdown Protection            ║")
     print("╚═══════════════════════════════════════════════════════════════╝")
 
-    try:
-        valid = {s["symbol"] for s in client.futures_exchange_info()["symbols"] if s["status"] == "TRADING"}
-        syms  = list(dict.fromkeys([s for s in SYMBOLS if s in valid]))
-    except:
-        syms  = list(dict.fromkeys(SYMBOLS))
-
-    print(f"  📋 {len(syms)} simbol aktif terpantau")
+    syms = list(dict.fromkeys(SYMBOLS))
+    print(f"  📋 {len(syms)} simbol terpantau")
 
     threading.Thread(target=t_monitor,         daemon=True).start()
     threading.Thread(target=t_slot_filler, args=(syms,), daemon=True).start()
     threading.Thread(target=t_rescan,      args=(syms,), daemon=True).start()
-    threading.Thread(target=t_macro,                    daemon=True).start()
+    threading.Thread(target=t_macro,                     daemon=True).start()
 
-    time.sleep(2)
-    tickers_all()
+    time.sleep(2); tickers_all()
 
     cycle = 0
     while True:
         cycle += 1
         slots = MAX_POSITIONS - len(live_positions)
         print(f"\n{'═'*62}")
-        print(f"  #{cycle} {time.strftime('%H:%M:%S')} BTC:{_macro['btc']} ({len(live_positions)}/{MAX_POSITIONS}) PnL:{_stats['pnl']:+.4f}U")
+        print(f"  #{cycle} {time.strftime('%H:%M:%S')} BTC:{_macro['btc']} Score_Min:{_prot['active_min_score']} ({len(live_positions)}/{MAX_POSITIONS}) PnL:{_stats['pnl']:+.4f}U")
 
-        if (k := ks_check())[0]:
-            print(f"  🚨 KS:{k[1]}")
-        elif slots == 0:
-            print(f"  ✅ Slots full")
-        else:
-            print(f"  🔍 {slots} slot kosong — Fast scanning...")
+        ks_status, ks_reason = ks_check()
+        if ks_status: print(f"  🚨 SYSTEM LOCK: {ks_reason}")
+        elif slots == 0: print(f"  ✅ Slots full")
+        else: print(f"  🔍 {slots} slot kosong — Sniper scanning...")
 
-        if cycle % 30 == 0:
-            print_full()
-
+        if cycle % 30 == 0: print_full()
         time.sleep(SCAN_INTERVAL)
 
 if __name__ == "__main__":
