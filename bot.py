@@ -1,15 +1,15 @@
 """
-Bot Scalping v20.0.0 — REGIME-AWARE ADAPTIVE TRADING ENGINE (REVERSED)
+Bot Scalping v21.0.0 — REGIME-AWARE ADAPTIVE TRADING ENGINE (DIRECT ENTRY)
 =============================================================
-PERUBAHAN FUNDAMENTAL dari v19.4.0 (Plus Reversed Logic):
-1. Market Regime Detection (5 regime: TRENDING_BULL, TRENDING_BEAR, RANGE, VOLATILE, EXHAUSTION)
-2. Trend Following saat regime TRENDING (TIDAK fade)
-3. Exhaustion Confirmation Layer: minimal 3 dari 9 kondisi untuk fade
-4. ATR-based TP/SL (REVERSED: TP menggunakan SL lama, SL menggunakan TP lama)
-5. Self-Learning Signal Weighting (adaptive scoring berdasarkan historical win rate)
-6. Logika Reversed: Sinyal LONG dieksekusi SHORT, sinyal SHORT dieksekusi LONG.
-7. Max Loss dibatasi 0.5% (net jadi 0.6% setelah fee masuk+keluar 0.1%) & Garansi TP
-   Minimal 0.5% (net jadi 0.4% setelah fee masuk+keluar 0.1%).
+PERUBAHAN dari v20.0.0 (Reversed):
+1. SL/TP DI-SWAP BALIK: SL kembali pakai ATR_MULT_SL (sempit, dibatasi max MAX_SL_PCT
+   1.5%), TP kembali pakai ATR_MULT_TP (lebar, lalu dipatok ke MAX_TP_PCT/
+   MIN_TP_GUARANTEE_PCT 0.5%, sehingga TP efektif tetap di 0.5%).
+2. ENTRY DI-SWAP BALIK ke arah normal: sinyal LONG dieksekusi LONG, sinyal SHORT
+   dieksekusi SHORT (reversal v20 dihilangkan).
+3. Market Regime Detection (5 regime: TRENDING_BULL, TRENDING_BEAR, RANGE, VOLATILE,
+   EXHAUSTION), Exhaustion Confirmation Layer, dan Self-Learning Signal Weighting
+   tidak berubah dari v20.0.0.
 
 Target: Profit Factor > 1.5, Win Rate > 55%, Avg RR > 1.8
 """
@@ -43,12 +43,12 @@ LEVERAGE = 20
 ORDER_USDT = 2.0
 MAX_POSITIONS = 3
 
-# Risk Management (Akan ditukar di RiskManager)
-ATR_MULT_SL = 1.2      # Awalnya SL, sekarang dipakai untuk TP
-ATR_MULT_TP = 2.5      # Awalnya TP, sekarang dipakai untuk SL
-MIN_RR_RATIO = 1.8     # (Sudah tidak dipaksa lagi karena reverse logic)
-MAX_SL_PCT = 0.015     # Maksimum SL persen (akan ditukar -> jadi cap TP aktual)
-MAX_TP_PCT = 0.005     # Maksimum TP persen (akan ditukar -> jadi cap SL aktual = MAX LOSS 0.5%)
+# Risk Management (sudah di-swap balik ke arah normal di RiskManager)
+ATR_MULT_SL = 1.2      # Dipakai untuk SL (sempit)
+ATR_MULT_TP = 2.5      # Dipakai untuk TP (lebar, lalu dipatok ke MAX_TP_PCT)
+MIN_RR_RATIO = 1.8     # (Tidak dipaksa, hanya referensi)
+MAX_SL_PCT = 0.015     # Cap SL maksimum 1.5%
+MAX_TP_PCT = 0.005     # Cap TP maksimum 0.5% (sama dengan garansi minimal -> TP efektif tetap 0.5%)
 MIN_TP_GUARANTEE_PCT = 0.005  # Garansi TP minimal 0.5% (net ~0.4% setelah fee 0.1%)
 TAKER_FEE_PCT = 0.0005        # Fee taker per sisi (0.05%) -> entry+exit = 0.1%
 
@@ -585,7 +585,7 @@ class SignalScorer:
         return score, signals
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  RISK MANAGER (REVERSED)
+#  RISK MANAGER (SWAPPED BACK / DIRECT)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class RiskManager:
@@ -593,28 +593,32 @@ class RiskManager:
     def calculate_sl_tp(entry_price: float, atr: float, direction: str) -> Tuple[float, float, float, float]:
         """
         Returns: (sl_price, tp_price, sl_pct, tp_pct)
-        LOGIKA REVERSE: 
-        - TP menggunakan jarak HardSL lama (sempit)
-        - SL menggunakan jarak ExtremeTP lama (lebar)
+        LOGIKA DI-SWAP BALIK (v21):
+        - SL kembali memakai jarak ATR_MULT_SL (sempit)
+        - TP kembali memakai jarak ATR_MULT_TP (lebar, lalu dipatok)
 
-        RISK TARGET (sesuai permintaan):
-        - Max Loss (gross/harga) dibatasi 0.5% -> net loss ~0.6% setelah fee masuk+keluar 0.1%
-        - Min Profit (gross/harga) digaransi 0.5% -> net profit ~0.4% setelah fee masuk+keluar 0.1%
+        RISK TARGET:
+        - TP (gross/harga) dipatok di MAX_TP_PCT (0.5%), sama dengan
+          MIN_TP_GUARANTEE_PCT, sehingga TP efektif konsisten di 0.5%
+          -> net profit ~0.4% setelah fee masuk+keluar 0.1%
+        - SL (gross/harga) dibatasi maksimum MAX_SL_PCT (1.5%), mengikuti ATR
+          jika lebih sempit dari itu -> net loss maksimum ~1.6% setelah fee
         """
-        # 1. TUKAR MULTIPLIER
-        sl_distance = ATR_MULT_TP * atr  # SL sekarang lebih lebar 
-        tp_distance = ATR_MULT_SL * atr  # TP sekarang lebih sempit (sebesar HardSL lama)
+        # 1. SWAP MULTIPLIER KEMBALI KE ARAH NORMAL
+        sl_distance = ATR_MULT_SL * atr   # SL kembali sempit (default)
+        tp_distance = ATR_MULT_TP * atr   # TP kembali lebar (default, sebelum dipatok)
 
-        # 2. SET GARANSI TP MINIMAL 0.5% (agar net profit ~0.4% setelah fee 0.1%)
+        # 2. GARANSI TP MINIMAL 0.5% (agar net profit ~0.4% setelah fee 0.1%)
         min_tp_distance = entry_price * MIN_TP_GUARANTEE_PCT
         if tp_distance < min_tp_distance:
             tp_distance = min_tp_distance
 
-        # 3. Batasi maksimum persen (Tukar max_sl dan max_tp)
-        #    max_sl = MAX LOSS, dibatasi MAX_TP_PCT (0.5%) -> net loss ~0.6% setelah fee
-        #    max_tp = cap atas TP, dari MAX_SL_PCT (tetap di atas garansi minimal)
-        max_sl = entry_price * MAX_TP_PCT
-        max_tp = entry_price * MAX_SL_PCT
+        # 3. Batasi maksimum persen (SWAP max_sl dan max_tp kembali)
+        #    max_sl = cap atas SL, dari MAX_SL_PCT (1.5%)
+        #    max_tp = cap atas TP, dari MAX_TP_PCT (0.5%) -> sama dengan garansi
+        #             minimal, sehingga TP efektif terpatok tetap di 0.5%
+        max_sl = entry_price * MAX_SL_PCT
+        max_tp = entry_price * MAX_TP_PCT
 
         sl_distance = min(sl_distance, max_sl)
         tp_distance = min(tp_distance, max_tp)
@@ -931,7 +935,7 @@ def monitor_positions():
                 live_close(sym, "ExtremeTP", px); continue
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  SCANNER THREAD (REVERSED LOGIC EMBEDDED)
+#  SCANNER THREAD (DIRECT LOGIC — TANPA REVERSAL)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def scan_one(sym):
@@ -953,15 +957,11 @@ def scan_one(sym):
         if direction is None: return None
 
         # -------------------------------------------------------------
-        # REVERSE LOGIC: Membalik arah entry agar loss jadi profit
+        # DIRECT LOGIC (v21): arah entry di-swap balik ke arah normal.
+        # Sinyal LONG dieksekusi LONG, sinyal SHORT dieksekusi SHORT.
+        # (Reversal v20 dihilangkan.)
         # -------------------------------------------------------------
-        if direction == "LONG":
-            direction = "SHORT"
-            sigs = ["REV_SHORT"] + sigs  # Penanda log: tadinya Long jadi Short
-        elif direction == "SHORT":
-            direction = "LONG"
-            sigs = ["REV_LONG"] + sigs   # Penanda log: tadinya Short jadi Long
-        # -------------------------------------------------------------
+        sigs = ["DIRECT"] + sigs
 
         px_live = price_live(sym)
         if px_live == 0: return None
@@ -1010,7 +1010,7 @@ def print_inline():
     n = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
     pnl, e = _stats["pnl"], "💚" if _stats["pnl"] >= 0 else "🔴"
-    print(f"       ┌ [v20.0 DRY REVERSED] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
+    print(f"       ┌ [v21.0 DRY DIRECT] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
     print(f"       └ ExTP:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']} | Regime WR: {learning.get_winrate_by_regime('TRENDING_BULL'):.0%}")
 
 def print_full():
@@ -1021,12 +1021,12 @@ def print_full():
     tph = n / sess if sess > 0 else 0
     e = "💚" if pnl >= 0 else "🔴"
     print(f"\n  {'─'*70}")
-    print(f"    ✅ DRY RUN v20.0 — REGIME-AWARE ADAPTIVE TRADING")
+    print(f"    ✅ DRY RUN v21.0 — REGIME-AWARE ADAPTIVE TRADING (DIRECT ENTRY)")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
     print(f"    {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     print(f"    💰 ExtremeTP:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']}")
     print(f"    📊 Learning: Global WR {learning.get_global_winrate():.1%}")
-    print(f"    ⚙️  TP/SL: REVERSED | Max Loss 0.5% (net ~0.6%) | Min TP 0.5% (net ~0.4%) | ATR-based")
+    print(f"    ⚙️  TP/SL: DIRECT (SWAPPED BACK) | TP terpatok 0.5% (net ~0.4%) | Max SL 1.5% | ATR-based")
     if trade_log:
         print(f"    📋 Last 5:")
         for t in trade_log[-5:]:
@@ -1109,9 +1109,9 @@ def t_macro():
 
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  ✅ DRY RUN v20.0 — REGIME-AWARE ADAPTIVE TRADING ENGINE (REVERSED)║")
-    print("║  ✅ REVERSED LOGIC ENABLED + MAX LOSS 0.5% / MIN TP 0.5%            ║")
-    print("║  ✅ Self-Learning Signal Weights & Adaptive Scanning               ║")
+    print("║  ✅ DRY RUN v21.0 — REGIME-AWARE ADAPTIVE TRADING ENGINE (DIRECT)   ║")
+    print("║  ✅ SL/TP & ENTRY DI-SWAP BALIK (NORMAL) | TP 0.5% / Max SL 1.5%    ║")
+    print("║  ✅ Self-Learning Signal Weights & Adaptive Scanning                ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
     try:
         valid = {s["symbol"] for s in client.futures_exchange_info()["symbols"] if s["status"] == "TRADING"}
