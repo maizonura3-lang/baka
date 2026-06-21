@@ -8,7 +8,8 @@ PERUBAHAN FUNDAMENTAL dari v19.4.0 (Plus Reversed Logic):
 4. ATR-based TP/SL (REVERSED: TP menggunakan SL lama, SL menggunakan TP lama)
 5. Self-Learning Signal Weighting (adaptive scoring berdasarkan historical win rate)
 6. Logika Reversed: Sinyal LONG dieksekusi SHORT, sinyal SHORT dieksekusi LONG.
-7. Garansi TP Minimal 0.15% untuk mengamankan dari fee.
+7. Max Loss dibatasi 0.5% (net jadi 0.6% setelah fee masuk+keluar 0.1%) & Garansi TP
+   Minimal 0.5% (net jadi 0.4% setelah fee masuk+keluar 0.1%).
 
 Target: Profit Factor > 1.5, Win Rate > 55%, Avg RR > 1.8
 """
@@ -46,8 +47,10 @@ MAX_POSITIONS = 3
 ATR_MULT_SL = 1.2      # Awalnya SL, sekarang dipakai untuk TP
 ATR_MULT_TP = 2.5      # Awalnya TP, sekarang dipakai untuk SL
 MIN_RR_RATIO = 1.8     # (Sudah tidak dipaksa lagi karena reverse logic)
-MAX_SL_PCT = 0.015     # Maksimum SL persen (akan ditukar)
-MAX_TP_PCT = 0.04      # Maksimum TP persen (akan ditukar)
+MAX_SL_PCT = 0.015     # Maksimum SL persen (akan ditukar -> jadi cap TP aktual)
+MAX_TP_PCT = 0.005     # Maksimum TP persen (akan ditukar -> jadi cap SL aktual = MAX LOSS 0.5%)
+MIN_TP_GUARANTEE_PCT = 0.005  # Garansi TP minimal 0.5% (net ~0.4% setelah fee 0.1%)
+TAKER_FEE_PCT = 0.0005        # Fee taker per sisi (0.05%) -> entry+exit = 0.1%
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  SYMBOLS
@@ -593,24 +596,30 @@ class RiskManager:
         LOGIKA REVERSE: 
         - TP menggunakan jarak HardSL lama (sempit)
         - SL menggunakan jarak ExtremeTP lama (lebar)
+
+        RISK TARGET (sesuai permintaan):
+        - Max Loss (gross/harga) dibatasi 0.5% -> net loss ~0.6% setelah fee masuk+keluar 0.1%
+        - Min Profit (gross/harga) digaransi 0.5% -> net profit ~0.4% setelah fee masuk+keluar 0.1%
         """
         # 1. TUKAR MULTIPLIER
         sl_distance = ATR_MULT_TP * atr  # SL sekarang lebih lebar 
         tp_distance = ATR_MULT_SL * atr  # TP sekarang lebih sempit (sebesar HardSL lama)
 
-        # 2. SET MINIMAL TP 0.15% (agar tidak habis dimakan fee)
-        min_tp_distance = entry_price * 0.0015
+        # 2. SET GARANSI TP MINIMAL 0.5% (agar net profit ~0.4% setelah fee 0.1%)
+        min_tp_distance = entry_price * MIN_TP_GUARANTEE_PCT
         if tp_distance < min_tp_distance:
             tp_distance = min_tp_distance
 
         # 3. Batasi maksimum persen (Tukar max_sl dan max_tp)
+        #    max_sl = MAX LOSS, dibatasi MAX_TP_PCT (0.5%) -> net loss ~0.6% setelah fee
+        #    max_tp = cap atas TP, dari MAX_SL_PCT (tetap di atas garansi minimal)
         max_sl = entry_price * MAX_TP_PCT
         max_tp = entry_price * MAX_SL_PCT
 
         sl_distance = min(sl_distance, max_sl)
         tp_distance = min(tp_distance, max_tp)
 
-        # Pastikan lagi TP tidak kurang dari 0.15% setelah dicek max_tp
+        # Pastikan lagi TP tidak kurang dari garansi minimal 0.5% setelah dicek max_tp
         if tp_distance < min_tp_distance:
             tp_distance = min_tp_distance
 
@@ -860,7 +869,7 @@ def live_close(sym, reason, price=None):
     
     side, entry, q_val = pos["side"], pos["entry"], pos["qty"]
     gross_pnl = (price - entry) * q_val if side == "LONG" else (entry - price) * q_val
-    fee_rate = 0.0005
+    fee_rate = TAKER_FEE_PCT
     total_fee = (entry * q_val + price * q_val) * fee_rate
     pnl = gross_pnl - total_fee
     pct = (price - entry) / entry * 100 if side == "LONG" else (entry - price) / entry * 100
@@ -1017,7 +1026,7 @@ def print_full():
     print(f"    {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     print(f"    💰 ExtremeTP:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']}")
     print(f"    📊 Learning: Global WR {learning.get_global_winrate():.1%}")
-    print(f"    ⚙️  TP/SL: REVERSED (TP 0.15% Min) | ATR-based")
+    print(f"    ⚙️  TP/SL: REVERSED | Max Loss 0.5% (net ~0.6%) | Min TP 0.5% (net ~0.4%) | ATR-based")
     if trade_log:
         print(f"    📋 Last 5:")
         for t in trade_log[-5:]:
@@ -1101,7 +1110,7 @@ def t_macro():
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
     print("║  ✅ DRY RUN v20.0 — REGIME-AWARE ADAPTIVE TRADING ENGINE (REVERSED)║")
-    print("║  ✅ REVERSED LOGIC ENABLED + TP MINIMAL 0.15%                      ║")
+    print("║  ✅ REVERSED LOGIC ENABLED + MAX LOSS 0.5% / MIN TP 0.5%            ║")
     print("║  ✅ Self-Learning Signal Weights & Adaptive Scanning               ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
     try:
